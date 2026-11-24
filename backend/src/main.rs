@@ -5,7 +5,7 @@ mod routes;
 mod services;
 mod state;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, process::Output, sync::Arc};
 
 use axum::http::{HeaderValue, Method};
 use sqlx::postgres::PgPoolOptions;
@@ -23,6 +23,7 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -82,7 +83,7 @@ async fn serve(
     let workers = tokio::spawn(async move {
         manager.run(worker_shutdown).await;
     });
-    let signal = async {
+    let signal = async move {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutdown signal received");
         shutdown.cancel();

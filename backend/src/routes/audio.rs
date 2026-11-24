@@ -2,7 +2,7 @@ use std::path::Path;
 
 use axum::{
     Json,
-    extract::{Multipart, Path as AxumPath, State, rejection::MultipartRejection},
+    extract::{Multipart, Path as AxumPath, State, multipart::MultipartRejection},
 };
 use serde::Serialize;
 use sqlx::FromRow;
