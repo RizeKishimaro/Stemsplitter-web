@@ -1,0 +1,64 @@
+
+.transport-bar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-height: 54px;
+  padding: 0 20px;
+  background: #292929;
+  color: #fff;
+  font-family: Arial, sans-serif;
+}
+
+.transport-bar__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.transport-bar button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #666;
+  background: transparent;
+  color: white;
+  cursor: pointer;
+}
+
+.transport-bar button:hover {
+  background: #444;
+}
+
+.transport-bar .transport-bar__play {
+  background: #f0441e;
+  border-color: #f0441e;
+}
+
+.transport-bar__timeline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transport-bar__progress {
+  height: 4px;
+  flex: 1;
+  background: #555;
+  overflow: hidden;
+}
+
+.transport-bar__progress-fill {
+  height: 100%;
+  background: #f0441e;
+}
+
+.transport-bar__status {
+  min-width: 58px;
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: #bbb;
+}
+

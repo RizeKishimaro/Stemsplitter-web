@@ -1,0 +1,20 @@
+
+
+.grid-background {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+  background-color: #f1e9dc;
+  background-image: url("../assets/grid-tile.svg");
+  background-size: 45px 45px;
+background-position: center 67.5px;
+background-repeat: repeat;
+}
+
+.grid-background__lines,
+.grid-background__crosses {
+  display: none;
+}
+
