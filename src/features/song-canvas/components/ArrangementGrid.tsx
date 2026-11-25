@@ -1,8 +1,14 @@
 
 
-import type { CSSProperties, MouseEvent } from "react";
+import { useCallback, useSyncExternalStore, type CSSProperties, type MouseEvent } from "react";
 
-import { useProjectStore } from "../../../stores/project.store";
+import {
+  setTimelineMarkerPosition,
+  type BeatSnapMode,
+  type TimelineMarkerKind,
+  useProjectStore,
+  useProjectStoreSelector,
+} from "../../../stores/project.store";
 import { audioEngine } from "../../audio-engine/AudioEngine";
 
 import {
@@ -17,11 +23,14 @@ import {
 
 import {
   useTransportStore,
+  getTransportFramePosition,
+  subscribeTransportFrames,
   type TransportState,
 } from "../../../stores/transport.store";
 
 import type { TrackType } from "./TrackHeader";
 import type { StemName } from "../../stem-separation/chunkEngine";
+import { markArrangementRender } from "./arrangementMetrics";
 
 import "./ArrangementGrid.css";
 
@@ -39,23 +48,35 @@ const TRACK_LABELS: Record<TrackType, string> = {
   vocals: "VOCALS",
 };
 
+const waveformCache = new WeakMap<Float32Array, Map<string, string>>();
+
 function getWaveformPath(
   channel: Float32Array,
   width = 180,
   height = 44,
   samples = 90,
+  rangeStart = 0,
+  rangeEnd = channel.length,
 ): string {
-  if (!channel.length) return "";
+  if (!channel.length || rangeEnd <= rangeStart) return "";
+  const cacheKey = `${width}:${height}:${samples}:${rangeStart}:${rangeEnd}`;
+  let paths = waveformCache.get(channel);
+  if (!paths) {
+    paths = new Map();
+    waveformCache.set(channel, paths);
+  }
+  const cached = paths.get(cacheKey);
+  if (cached) return cached;
 
   const center = height / 2;
-  const step = channel.length / samples;
+  const step = (rangeEnd - rangeStart) / samples;
   const points: string[] = [];
 
   for (let i = 0; i < samples; i++) {
-    const start = Math.floor(i * step);
+    const start = rangeStart + Math.floor(i * step);
     const end = Math.min(
-      channel.length,
-      Math.max(start + 1, Math.floor((i + 1) * step)),
+      rangeEnd,
+      Math.max(start + 1, rangeStart + Math.floor((i + 1) * step)),
     );
 
     let peak = 0;
@@ -73,7 +94,9 @@ function getWaveformPath(
     );
   }
 
-  return points.join(" ");
+  const path = points.join(" ");
+  paths.set(cacheKey, path);
+  return path;
 }
 
 /**
@@ -203,37 +226,23 @@ function ClipControls({
  *
  * The position always comes from the shared global transport clock.
  */
-function getClipPlayhead(
-  clip: AudioClip,
-  transport: TransportState,
-): number | null {
+function useClipPlayheadProgress(clip: AudioClip, transport: TransportState) {
   const isInPlaybackSession =
     transport.playingClipIds.includes(clip.id);
-
-  if (!isInPlaybackSession) return null;
-
-  if (!transport.isPlaying && !transport.isPaused) {
-    return null;
-  }
-
   const clipDuration = clip.endTime - clip.startTime;
+  const getSnapshot = useCallback(() => {
+    if (!isInPlaybackSession || (!transport.isPlaying && !transport.isPaused) || clipDuration <= 0) return null;
+    const elapsed = getTransportFramePosition() - clip.startTime;
+    if (elapsed < 0 || (!clip.loopEnabled && elapsed > clipDuration)) return null;
+    return clip.loopEnabled ? (elapsed % clipDuration) / clipDuration : Math.min(1, elapsed / clipDuration);
+  }, [clip.startTime, clipDuration, clip.loopEnabled, isInPlaybackSession, transport.isPlaying, transport.isPaused]);
+  return useSyncExternalStore(subscribeTransportFrames, getSnapshot, getSnapshot);
+}
 
-  if (clipDuration <= 0) return null;
-
-  const elapsed = transport.currentTime - clip.startTime;
-
-  // The clip has not started yet.
-  if (elapsed < 0) return null;
-
-  // Looping clips wrap their visual playhead.
-  if (clip.loopEnabled) {
-    return (elapsed % clipDuration) / clipDuration;
-  }
-
-  // Non-looping clips stop showing the playhead after their end.
-  if (elapsed > clipDuration) return null;
-
-  return Math.min(1, elapsed / clipDuration);
+function ClipPlayhead({ clip, transport }: { clip: AudioClip; transport: TransportState }) {
+  const progress = useClipPlayheadProgress(clip, transport);
+  if (progress === null) return null;
+  return <div className="arrangement-clip__playhead" style={{ left: `${progress * 100}%` }} />;
 }
 
 /**
@@ -256,12 +265,7 @@ function SectionClip({
 
   if (!channel) return null;
 
-  const clipAudio = channel.subarray(
-    clip.sourceStartSample,
-    clip.sourceEndSample,
-  );
-
-  const path = getWaveformPath(clipAudio);
+  const path = getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample);
 
   const sectionDuration = sectionEnd - sectionStart;
 
@@ -272,11 +276,6 @@ function SectionClip({
 
   const widthPercent =
     ((clip.endTime - clip.startTime) / sectionDuration) * 100;
-
-  const playheadProgress = getClipPlayhead(
-    clip,
-    transport,
-  );
 
   return (
     <div
@@ -292,14 +291,7 @@ function SectionClip({
       }}
       title={`${clip.stem.toUpperCase()} · ${clip.startTime.toFixed(2)}s–${clip.endTime.toFixed(2)}s`}
     >
-      {playheadProgress !== null && (
-        <div
-          className="arrangement-clip__playhead"
-          style={{
-            left: `${playheadProgress * 100}%`,
-          }}
-        />
-      )}
+      <ClipPlayhead clip={clip} transport={transport} />
 
       <svg
         className="arrangement-clip__waveform"
@@ -324,6 +316,94 @@ function SectionClip({
   );
 }
 
+function BeatMarkers({
+  startSample,
+  endSample,
+  sampleRate,
+  beats,
+  downbeats,
+  snapMode,
+  snapTargets,
+}: {
+  startSample: number;
+  endSample: number;
+  sampleRate: number;
+  beats: Array<{ original: number; sample: number }>;
+  downbeats: Array<{ original: number; sample: number; bar: number }>;
+  snapMode: BeatSnapMode;
+  snapTargets: number[];
+}) {
+  const duration = endSample - startSample;
+  if (duration <= 0 || sampleRate <= 0) return null;
+
+  const renderMarker = (
+    kind: TimelineMarkerKind,
+    originalSample: number,
+    sample: number,
+    label?: string,
+  ) => {
+    if (sample < startSample || sample >= endSample) return null;
+    const leftPercent = ((sample - startSample) / duration) * 100;
+    const time = (pointerX: number, row: HTMLElement) => {
+      const bounds = row.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (pointerX - bounds.left) / bounds.width));
+      const target = Math.round(startSample + ratio * duration);
+      const snappedTarget = snapMode === "off" || !snapTargets.length
+        ? target
+        : snapTargets.reduce((closest, candidate) =>
+            Math.abs(candidate - target) < Math.abs(closest - target) ? candidate : closest,
+          snapTargets[0]);
+      setTimelineMarkerPosition(
+        kind,
+        originalSample,
+        Math.max(startSample, Math.min(endSample - 1, snappedTarget)),
+      );
+    };
+    return (
+      <button
+        key={`${kind}:${originalSample}`}
+        type="button"
+        className={`timeline-marker timeline-marker--${kind}`}
+        style={{ left: `${leftPercent}%` }}
+        role="slider"
+        aria-label={label ? `Bar ${label} downbeat marker` : "Beat marker"}
+        aria-valuemin={startSample}
+        aria-valuemax={endSample}
+        aria-valuenow={sample}
+        title={label ? `Bar ${label} · drag to adjust` : `Beat · drag to adjust`}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (event.buttons !== 1) return;
+          const row = event.currentTarget.closest(".arrangement-row");
+          if (row instanceof HTMLElement) time(event.clientX, row);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const step = event.shiftKey ? sampleRate : Math.max(1, Math.round(sampleRate / 100));
+          setTimelineMarkerPosition(
+            kind,
+            originalSample,
+            Math.max(startSample, Math.min(endSample - 1, sample + (event.key === "ArrowRight" ? step : -step))),
+          );
+        }}
+      >
+        {label && <span className="timeline-marker__label">{label}</span>}
+      </button>
+    );
+  };
+
+  return (
+    <div className="timeline-markers" aria-label="Master beat grid">
+      {beats.map((beat) => renderMarker("beat", beat.original, beat.sample))}
+      {downbeats.map((beat) => renderMarker("downbeat", beat.original, beat.sample, String(beat.bar)))}
+    </div>
+  );
+}
+
 /**
  * One arrangement column.
  */
@@ -334,6 +414,11 @@ function TrackColumn({
   selectedClipId,
   transport,
   rowCount,
+  beats,
+  downbeats,
+  sampleRate,
+  snapMode,
+  snapTargets,
 }: {
   type: TrackType;
   clips: AudioClip[];
@@ -341,6 +426,11 @@ function TrackColumn({
   selectedClipId: string | null;
   transport: TransportState;
   rowCount: number;
+  beats: Array<{ original: number; sample: number }>;
+  downbeats: Array<{ original: number; sample: number; bar: number }>;
+  sampleRate: number;
+  snapMode: BeatSnapMode;
+  snapTargets: number[];
 }) {
   const stem = type as StemName;
 
@@ -374,6 +464,7 @@ function TrackColumn({
               className="arrangement-row"
               key={row}
             >
+              {projectMarkerSection(sections, clipsByRow, row, beats, downbeats, sampleRate, snapMode, snapTargets)}
               {rowClips.map((clip) => {
                 const section = sections[clip.sectionId];
 
@@ -406,11 +497,46 @@ function TrackColumn({
   );
 }
 
+function projectMarkerSection(
+  sections: ReturnType<typeof useProjectStore>["completedSections"],
+  clipsByRow: Map<number, AudioClip[]>,
+  row: number,
+  beats: Array<{ original: number; sample: number }>,
+  downbeats: Array<{ original: number; sample: number; bar: number }>,
+  sampleRate: number,
+  snapMode: BeatSnapMode,
+  snapTargets: number[],
+) {
+  const clip = clipsByRow.get(row)?.[0];
+  const section = clip ? sections[clip.sectionId] : null;
+  if (!section) return null;
+  return (
+    <BeatMarkers
+      startSample={section.startSample}
+      endSample={section.endSample}
+      sampleRate={sampleRate}
+      beats={beats}
+      downbeats={downbeats}
+      snapMode={snapMode}
+      snapTargets={snapTargets}
+    />
+  );
+}
+
 /**
  * Main arrangement grid.
  */
 export function ArrangementGrid() {
-  const project = useProjectStore();
+  markArrangementRender();
+  const project = useProjectStoreSelector((state) => ({
+    sections: state.sections,
+    completedSections: state.completedSections,
+    masterTimeline: state.masterTimeline,
+    beatMarkerGrid: state.beatMarkerGrid,
+    timelineCorrections: state.timelineCorrections,
+    downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
+    beatSnapMode: state.beatSnapMode,
+  }));
   const clipState = useClipStore();
   const transport = useTransportStore();
 
@@ -423,6 +549,25 @@ export function ArrangementGrid() {
     project.sections.length,
     Object.keys(project.completedSections).length,
   );
+  const timeline = project.masterTimeline;
+  const markerGrid = project.beatMarkerGrid ?? (timeline ? {
+    sampleRate: timeline.sampleRate,
+    beatSamples: timeline.beatSamples,
+    downbeatSamples: timeline.downbeatSamples,
+  } : null);
+  const beats = markerGrid?.beatSamples.map((original) => ({
+    original,
+    sample: project.timelineCorrections[`beat:${original}`] ?? original,
+  })) ?? [];
+  const downbeats = markerGrid?.downbeatSamples.map((original, index) => ({
+    original,
+    sample: project.timelineCorrections[`downbeat:${original}`]
+      ?? original + project.downbeatPhaseOffsetSamples,
+    bar: index + 1,
+  })) ?? [];
+  const snapTargets = project.beatSnapMode === "bar"
+    ? downbeats.map((beat) => beat.sample)
+    : beats.map((beat) => beat.sample);
 
   return (
     <section
@@ -454,10 +599,15 @@ export function ArrangementGrid() {
             clips={activeClips.filter(
               clip => clip.stem === track,
             )}
-            sections={project.completedSections}
+    sections={project.completedSections}
             selectedClipId={clipState.selectedClipId}
             transport={transport}
             rowCount={rowCount}
+            beats={beats}
+            downbeats={downbeats}
+            sampleRate={markerGrid?.sampleRate ?? 0}
+            snapMode={project.beatSnapMode}
+            snapTargets={snapTargets}
           />
         ))}
       </div>

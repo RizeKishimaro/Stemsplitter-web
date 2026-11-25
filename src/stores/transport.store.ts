@@ -26,6 +26,8 @@ const initialState: TransportState = {
 
 let state = initialState;
 const listeners = new Set<() => void>();
+const frameListeners = new Set<() => void>();
+let framePosition = 0;
 
 function emit() {
   listeners.forEach(listener => listener());
@@ -33,6 +35,10 @@ function emit() {
 
 export function getTransportState() {
   return state;
+}
+
+export function getTransportSnapshot() {
+  return { ...state, currentTime: framePosition };
 }
 
 export function subscribeTransport(listener: () => void) {
@@ -52,11 +58,38 @@ export function updateTransport(
   partial: Partial<TransportState>,
 ) {
   state = { ...state, ...partial };
+  if (partial.currentTime !== undefined) {
+    framePosition = partial.currentTime;
+    frameListeners.forEach(listener => listener());
+  }
   emit();
+}
+
+/** High-frequency visual clock. Audio playback itself remains driven by AudioContext. */
+export function publishTransportFrame(position: number) {
+  if (!Number.isFinite(position) || position === framePosition) return;
+  framePosition = position;
+  frameListeners.forEach(listener => listener());
+}
+
+export function subscribeTransportFrames(listener: () => void) {
+  frameListeners.add(listener);
+  return () => frameListeners.delete(listener);
+}
+
+export function getTransportFramePosition() { return framePosition; }
+
+export function useTransportPosition() {
+  return useSyncExternalStore(
+    subscribeTransportFrames,
+    getTransportFramePosition,
+    () => framePosition,
+  );
 }
 
 export function resetTransport() {
   state = { ...initialState };
+  framePosition = 0;
+  frameListeners.forEach(listener => listener());
   emit();
 }
-

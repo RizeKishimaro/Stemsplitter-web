@@ -22,6 +22,7 @@ import {
   getTransportState,
   updateTransport,
   resetTransport,
+  publishTransportFrame,
   type PlaybackMode,
 } from "../../stores/transport.store";
 
@@ -80,9 +81,7 @@ class AudioEngine {
         section.sampleRate,
       );
       for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-        buffer.getChannelData(channel).set(
-          Float32Array.from(channels[channel].subarray(0, frameCount)),
-        );
+        buffer.getChannelData(channel).set(channels[channel].subarray(0, frameCount));
       }
       this.preparedBuffers.set(key, buffer);
 
@@ -434,10 +433,7 @@ class AudioEngine {
 
       const position = this.getPosition();
 
-      updateTransport({
-        currentTime: Math.min(position, this.duration),
-        playingClipIds: [...this.activeClipIds],
-      });
+      publishTransportFrame(Math.min(position, this.duration));
 
       if (
         this.mode === "arrangement" &&

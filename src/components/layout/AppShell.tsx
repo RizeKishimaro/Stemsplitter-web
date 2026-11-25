@@ -1,9 +1,11 @@
 import { useEffect, useRef } from "react";
 import {
   getClipState,
+  restoreClipSnapshot,
   registerSectionClips,
   resetClips,
   setClipStartTime,
+  subscribeClips,
 } from "../../stores/clip.store";
 
 import { AudioImportScreen } from "../../features/audio-import/components/AudioImportScreen";
@@ -14,8 +16,9 @@ import {
 } from "../../features/stem-separation/separationPlan";
 import { startSeparation } from "../../features/stem-separation/separationScheduler";
 import { audioEngine } from "../../features/audio-engine/AudioEngine";
+import { recoverBackendChunks, startBackendSeparationFromFile, type AnalysisStrategy } from "../../lib/backendSeparationClient";
 import { getAudioContext } from "../../features/audio-engine/AudioContextManager";
-import { getTransportState } from "../../stores/transport.store";
+import { getTransportSnapshot } from "../../stores/transport.store";
 import type { SeparatedSection } from "../../features/stem-separation/separationScheduler";
 
 import {
@@ -30,10 +33,13 @@ import {
   setSectionProgress,
   setSeparationPlan,
   getProjectState,
-  useProjectStore,
+  restoreProjectSnapshot,
+  useProjectStoreSelector,
 } from "../../stores/project.store";
+import { clearLocalProject, clearLocalSections, loadLocalProject, saveLocalProject, saveLocalSection } from "../../lib/localProjectStore";
 
 import { SongCanvas } from "../../features/song-canvas/components/SongCanvas";
+import { getArrangementRenderCount } from "../../features/song-canvas/components/arrangementMetrics";
 
 import "./AppShell.css";
 
@@ -49,11 +55,12 @@ declare global {
       stop: () => void;
       snapshot: () => {
         audioContextCurrentTime: number;
-        transport: ReturnType<typeof getTransportState>;
+          transport: ReturnType<typeof getTransportSnapshot>;
         clips: ReturnType<typeof getClipState>["clips"];
         status: ReturnType<typeof getProjectState>["status"];
         masterTimelineReady: boolean;
-        audioDiagnostics: ReturnType<typeof audioEngine.getDiagnostics>;
+          audioDiagnostics: ReturnType<typeof audioEngine.getDiagnostics>;
+          arrangementRenderCount: number;
         sections: Array<{
           id: string;
           startSample: number;
@@ -69,10 +76,90 @@ declare global {
 }
 
 export function AppShell() {
-  const project = useProjectStore();
+  const project = useProjectStoreSelector((state) => ({
+    file: state.file,
+    audio: state.audio,
+    analysis: state.analysis,
+    masterTimeline: state.masterTimeline,
+    beatMarkerGrid: state.beatMarkerGrid,
+    timelineCorrections: state.timelineCorrections,
+    beatSnapMode: state.beatSnapMode,
+    downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
+    sections: state.sections,
+    status: state.status,
+  }));
 
   const cancelCurrentJob = useRef<(() => void) | null>(null);
   const separatedSections = useRef<SeparatedSection[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const recoveryController = new AbortController();
+    void loadLocalProject().then(async (saved) => {
+      if (!saved || cancelled || getProjectState().file) return;
+      const file = new File([saved.project.file], saved.project.fileName, { type: saved.project.fileType });
+      const audio = await getAudioContext().decodeAudioData(await file.arrayBuffer());
+      if (cancelled || getProjectState().file) return;
+      const restoredState = {
+        ...saved.project.state,
+        status: saved.sections.length ? "ready" as const : "imported" as const,
+      };
+      restoreProjectSnapshot(file, audio, restoredState, saved.sections);
+      restoreClipSnapshot(saved.project.clips);
+      for (const section of saved.sections) audioEngine.prepareSection(section);
+      for (const section of saved.sections) registerSectionClips(section);
+      if (saved.project.backendJobId) {
+        void recoverBackendChunks(saved.project.backendJobId, recoveryController.signal)
+          .catch((error: unknown) => {
+            if (recoveryController.signal.aborted) return;
+            const message = error instanceof Error ? error.message : String(error);
+            setProjectError(`Could not recover backend chunks: ${message}`);
+            console.warn("Could not recover backend chunks", error);
+          });
+      }
+    }).catch((error: unknown) => console.warn("Could not restore local DubPad project", error));
+    return () => { cancelled = true; recoveryController.abort(); };
+  }, []);
+
+  useEffect(() => {
+    if (!project.file || !project.audio) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const persist = () => {
+      const current = getProjectState();
+      if (current.file && current.audio) {
+        void saveLocalProject(current.file, current, getClipState().clips)
+          .catch((error: unknown) => console.warn("Could not save local DubPad project", error));
+      }
+    };
+    persist();
+    const schedulePersist = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(persist, 200);
+    };
+    const unsubscribe = subscribeClips(schedulePersist);
+    return () => {
+      unsubscribe();
+      if (timer) clearTimeout(timer);
+    };
+  }, [project.file, project.audio, project.analysis, project.masterTimeline, project.beatMarkerGrid,
+    project.timelineCorrections, project.beatSnapMode, project.downbeatPhaseOffsetSamples,
+    project.sections, project.status]);
+
+  async function handleBackendSeparation(strategy: AnalysisStrategy, beatsPerBar: number, report: (message: string) => void) {
+    if (!project.file || !project.audio) throw new Error("Import audio before starting HTDemucs separation.");
+    cancelCurrentJob.current?.();
+    audioEngine.stop();
+    audioEngine.clearPreparedBuffers();
+    resetClips();
+    setSeparationPlan([]);
+    const handle = await startBackendSeparationFromFile(project.file, project.audio, strategy, {
+      onProgress: (event) => report(`${event.event ?? "job"}${event.progress === undefined ? "" : ` · ${Math.round(event.progress)}%`}${event.message ? ` · ${event.message}` : ""}`),
+      onError: (error) => { report(error.message); setProjectError(error.message); },
+      onComplete: () => report("All synchronized HTDemucs chunks are ready."),
+    }, beatsPerBar);
+    cancelCurrentJob.current = handle.close;
+    report(`HTDemucs job ${handle.jobId} is running.`);
+  }
 
   useEffect(() => {
     if (!import.meta.env.DEV || !new URLSearchParams(location.search).has("e2e")) {
@@ -89,11 +176,12 @@ export function AppShell() {
       stop: () => audioEngine.stop(),
       snapshot: () => ({
         audioContextCurrentTime: getAudioContext().currentTime,
-        transport: getTransportState(),
+        transport: getTransportSnapshot(),
         clips: getClipState().clips,
         status: getProjectState().status,
         masterTimelineReady: getProjectState().masterTimeline !== null,
         audioDiagnostics: audioEngine.getDiagnostics(),
+        arrangementRenderCount: getArrangementRenderCount(),
         sections: Object.values(getProjectState().completedSections).map((section) => ({
           id: section.id,
           startSample: section.startSample,
@@ -124,6 +212,10 @@ export function AppShell() {
     audioEngine.clearPreparedBuffers();
     separatedSections.current = [];
     resetClips();
+    void clearLocalProject().then(() => {
+      const current = getProjectState();
+      if (current.file === file) return saveLocalProject(file, current, getClipState().clips);
+    }).catch((error: unknown) => console.warn("Could not replace previous local DubPad project", error));
 
     // Save the original audio.
     setImportedAudio(file, audio);
@@ -180,6 +272,7 @@ export function AppShell() {
 
                 onSectionComplete: (section) => {
                   separatedSections.current.push(section);
+                  void saveLocalSection(section).catch((error: unknown) => console.warn("Could not save local audio section", error));
                   // Keep progressive PCM results available while processing.
                   // These sections follow the temporary import analysis grid;
                   // do not expose them as playable arrangement clips until
@@ -243,6 +336,8 @@ export function AppShell() {
                             audioEngine.prepareSection(section);
                             registerSectionClips(section);
                           }
+                          void clearLocalSections().then(() => Promise.all(masterSections.map(saveLocalSection)))
+                            .catch((error: unknown) => console.warn("Could not persist finalized audio sections", error));
                           finishSeparation();
                           cancelCurrentJob.current = null;
 
@@ -317,7 +412,7 @@ export function AppShell() {
 
   return (
     <div className="app-shell">
-      <SongCanvas />
+      <SongCanvas onBackendSeparation={handleBackendSeparation} />
 
       {!project.audio && (
         <div className="app-shell__import-overlay">

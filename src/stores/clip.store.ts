@@ -342,3 +342,8 @@ export function resetClips() {
 
   emit();
 }
+
+export function restoreClipSnapshot(clips: Record<string, AudioClip>) {
+  state = { clips, selectedClipId: null };
+  emit();
+}

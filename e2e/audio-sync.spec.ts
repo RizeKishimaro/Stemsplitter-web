@@ -66,6 +66,7 @@ declare global {
           activeSources: Array<{ clipId: string; stem: string; effectiveGain: number }>;
           preparedBuffers: Array<{ key: string; sampleRate: number; duration: number; length: number }>;
         } | null;
+        arrangementRenderCount: number;
         clips: Record<string, {
           id: string;
           stem: string;
@@ -475,6 +476,36 @@ test("import, separate, and keep stems aligned in Firefox Web Audio", async ({ p
     () => window.__SONICLAB_E2E__!.snapshot().audioDiagnostics?.activeSourceCount ?? -1,
   )).toBe(0);
 
+  const renderCountBeforePlayback = await page.evaluate(
+    () => window.__SONICLAB_E2E__!.snapshot().arrangementRenderCount,
+  );
+  await page.evaluate(() => window.__SONICLAB_E2E__!.playArrangement(0));
+  const frameMetrics = await page.evaluate(() => new Promise<{ fps: number; maxGapMs: number }>((resolve) => {
+    let frames = 0;
+    let first = 0;
+    let previous = 0;
+    let maxGapMs = 0;
+    const tick = (time: number) => {
+      if (!first) first = time;
+      if (previous) maxGapMs = Math.max(maxGapMs, time - previous);
+      previous = time;
+      frames++;
+      if (frames >= 90) resolve({ fps: (frames - 1) * 1000 / (time - first), maxGapMs });
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }));
+  await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
+  const renderCountAfterPlayback = await page.evaluate(
+    () => window.__SONICLAB_E2E__!.snapshot().arrangementRenderCount,
+  );
+  expect(frameMetrics.fps).toBeGreaterThanOrEqual(50);
+  expect(renderCountAfterPlayback - renderCountBeforePlayback).toBeLessThanOrEqual(2);
+  await testInfo.attach("ui-frame-metrics.json", {
+    body: JSON.stringify({ ...frameMetrics, arrangementRendersDuringPlayback: renderCountAfterPlayback - renderCountBeforePlayback }, null, 2),
+    contentType: "application/json",
+  });
+
   expect(consoleErrors, "browser console errors").toEqual([]);
   expect(failedRequests, "failed browser requests").toEqual([]);
   await testInfo.attach("web-audio-schedules.json", {
@@ -500,5 +531,24 @@ test("import, separate, and keep stems aligned in Firefox Web Audio", async ({ p
     body: `${browser.browserType().name()} ${browser.version()}`,
     contentType: "text/plain",
   });
+  const expectedLocalSectionIds = await page.evaluate(() =>
+    window.__SONICLAB_E2E__!.snapshot().sections.map((section) => section.id).sort(),
+  );
+  await expect.poll(() => page.evaluate(() => new Promise<string[]>((resolve, reject) => {
+    const request = indexedDB.open("dubpad-local-projects", 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const database = request.result;
+      const getAll = database.transaction("sections").objectStore("sections").getAllKeys();
+      getAll.onsuccess = () => { const value = getAll.result.map(String).sort(); database.close(); resolve(value); };
+      getAll.onerror = () => reject(getAll.error);
+    };
+  }))).toEqual(expectedLocalSectionIds);
+  await page.reload();
+  await expect.poll(() => page.evaluate(
+    () => window.__SONICLAB_E2E__?.snapshot().masterTimelineReady ?? false,
+  )).toBe(true);
+  await expect(page.locator('[aria-label="DRUMS arrangement"] [data-clip-id]').first()).toBeVisible();
+  expect(await page.evaluate(() => Object.keys(window.__SONICLAB_E2E__!.snapshot().clips).length)).toBeGreaterThan(0);
   await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
 });
