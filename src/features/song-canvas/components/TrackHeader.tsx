@@ -42,12 +42,12 @@ const tracks = {
   vocals: {
     label: "VOCALS",
     icon: "/icons/icon-vocals.svg",
-    color: "#ed4385",
+    color: "#159966",
   },
   other: {
     label: "OTHER",
     icon: "/icons/icon-other.svg",
-    color: "#159966",
+    color: "#ed4385",
   },
 } satisfies Record<TrackType, {
   label: string;

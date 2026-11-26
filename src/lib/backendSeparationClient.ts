@@ -171,7 +171,7 @@ export function buildSectionSchedule(
   frames: number,
   beatSamples: number[],
   downbeatSamples: number[],
-  segmentSize: ArrangementSegmentSize = "1bar",
+  segmentSize: ArrangementSegmentSize = "4bars",
   beatsPerBar = 4,
 ): SeparationSection[] {
   if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0 ||
@@ -276,7 +276,7 @@ export function buildSectionsFromBeatGrid(
   jobId: string,
   grid: BeatGrid,
   stems: Record<StemName, Float32Array[]>,
-  segmentSize: ArrangementSegmentSize = "1bar",
+  segmentSize: ArrangementSegmentSize = "4bars",
 ): SeparatedSection[] {
   const { sampleRate, frames, channels, durationSeconds } = grid.audio;
   if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0 ||
@@ -371,7 +371,7 @@ export async function fetchSuccessfulJobAudio(
   job: BackendJob,
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
-  segmentSize: ArrangementSegmentSize = "1bar",
+  segmentSize: ArrangementSegmentSize = "4bars",
 ): Promise<{ grid: BeatGrid; sections: SeparatedSection[] }> {
   if (job.status !== "SUCCEEDED") throw new Error(`Separation job is ${job.status.toLowerCase()}.`);
   const metadataProjectId = job.result_metadata?.projectId;
@@ -451,10 +451,12 @@ export async function startBackendSeparationFromFile(
   strategy: AnalysisStrategy,
   callbacks: BackendSeparationCallbacks,
   beatsPerBar = 4,
+  signal?: AbortSignal,
 ) {
   const projectResponse = await fetch(apiUrl("projects"), {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: file.name.replace(/\.[^.]+$/, "").slice(0, 200) || "DubPad Project" }),
+    signal,
   });
   const project = await responseJson<{ id: string }>(projectResponse, "Could not create backend project");
   const form = new FormData();
@@ -462,9 +464,9 @@ export async function startBackendSeparationFromFile(
   form.set("sample_rate", String(audio.sampleRate));
   form.set("channels", String(audio.numberOfChannels));
   form.set("frame_count", String(audio.length));
-  const uploadResponse = await fetch(apiUrl(`projects/${encodeURIComponent(project.id)}/audio`), { method: "POST", body: form });
+  const uploadResponse = await fetch(apiUrl(`projects/${encodeURIComponent(project.id)}/audio`), { method: "POST", body: form, signal });
   const asset = await responseJson<{ id: string }>(uploadResponse, "Could not upload audio for HTDemucs");
-  return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar);
+  return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar, signal);
 }
 
 /** Starts HTDemucs and loads the persisted full stems and beat grid after completion. */
@@ -474,35 +476,47 @@ export async function startBackendSeparation(
   strategy: AnalysisStrategy,
   callbacks: BackendSeparationCallbacks,
   beatsPerBar = 4,
+  signal?: AbortSignal,
 ) {
+  if (signal?.aborted) throw new DOMException("Operation aborted", "AbortError");
   const response = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}/jobs`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ audio_asset_id: audioAssetId, job_type: "separate", analysis_strategy: strategy, beats_per_bar: beatsPerBar }),
+    signal,
   });
   const job = await responseJson<BackendJob>(response, "Could not create separation job");
   await saveBackendJobId(job.id);
   setProjectStatus("separating");
 
   const socket = new WebSocket(websocketUrl(`jobs/${encodeURIComponent(job.id)}/events`));
+  if (signal?.aborted) {
+    socket.close();
+    throw new DOMException("Operation aborted", "AbortError");
+  }
   let manualClose = false;
   let completed = false;
   let completion: Promise<void> | undefined;
   const complete = () => {
     if (completion) return completion;
     completion = (async () => {
-      let latest = await getJob(job.id);
+      let latest = await getJob(job.id, signal);
       while (latest.status === "QUEUED" || latest.status === "RUNNING") {
-        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
-        latest = await getJob(job.id);
+        await abortableDelay(1_000, signal);
+        latest = await getJob(job.id, signal);
       }
       if (latest.status !== "SUCCEEDED") throw new Error(latest.error_message || `Separation job ${latest.status.toLowerCase()}.`);
-      await loadSuccessfulJob(latest);
+      callbacks.onProgress?.({
+        stage: "LOADING_AUDIO",
+        message: "Retrieving the saved beat grid and four full-length stems",
+      });
+      await loadSuccessfulJob(latest, signal);
       completed = true;
       callbacks.onComplete?.();
       socket.close();
     })().catch((error: unknown) => {
       completion = undefined;
+      if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
       callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
       throw error;
     });
@@ -511,6 +525,7 @@ export async function startBackendSeparation(
   };
 
   socket.onmessage = (message) => {
+    if (signal?.aborted) return;
     try {
       const event = JSON.parse(String(message.data)) as BackendEvent;
       callbacks.onProgress?.(event);
@@ -524,15 +539,37 @@ export async function startBackendSeparation(
       callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
     }
   };
-  socket.onerror = () => callbacks.onError?.(new Error("Separation job WebSocket connection failed."));
+  socket.onerror = () => {
+    if (!signal?.aborted) callbacks.onError?.(new Error("Separation job WebSocket connection failed."));
+  };
   socket.onclose = () => {
-    if (manualClose || completed || completion) return;
-    void recoverBackendJob(job.id).then(() => {
+    if (manualClose || completed || completion || signal?.aborted) return;
+    void recoverBackendJob(job.id, signal).then(() => {
       completed = true;
       callbacks.onComplete?.();
     }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
   };
-  return { jobId: job.id, close: () => { manualClose = true; socket.close(); } };
+  const close = () => { manualClose = true; socket.close(); };
+  signal?.addEventListener("abort", close, { once: true });
+  return { jobId: job.id, close };
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Operation aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Operation aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 /** Restores a successful job from project and analysis metadata after reconnect or reload. */

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getClipState,
   restoreClipSnapshot,
@@ -9,34 +9,21 @@ import {
 } from "../../stores/clip.store";
 
 import { AudioImportScreen } from "../../features/audio-import/components/AudioImportScreen";
-import { analyzeAudio } from "../../features/audio-analysis/analysisClient";
-import {
-  assembleMasterTimelineSections,
-  buildSeparationPlan,
-} from "../../features/stem-separation/separationPlan";
-import { startSeparation } from "../../features/stem-separation/separationScheduler";
 import { audioEngine } from "../../features/audio-engine/AudioEngine";
-import { changeArrangementSegmentSize, recoverBackendJob, startBackendSeparationFromFile, type AnalysisStrategy } from "../../lib/backendSeparationClient";
+import { changeArrangementSegmentSize, recoverBackendJob, startBackendSeparationFromFile } from "../../lib/backendSeparationClient";
 import { getAudioContext } from "../../features/audio-engine/AudioContextManager";
 import { getTransportSnapshot } from "../../stores/transport.store";
 import type { SeparatedSection } from "../../features/stem-separation/separationScheduler";
-
 import {
-  addSeparatedSection,
-  finishSeparation,
-  setAnalysisResult,
+  setArrangementSections,
   setImportedAudio,
-  setMasterTimelineSections,
   setProjectError,
   setProjectStatus,
-  setSectionError,
-  setSectionProgress,
-  setSeparationPlan,
   getProjectState,
   restoreProjectSnapshot,
   useProjectStoreSelector,
 } from "../../stores/project.store";
-import { clearLocalProject, clearLocalSections, loadLocalProject, saveLocalProject, saveLocalSection } from "../../lib/localProjectStore";
+import { clearLocalProject, loadLocalProject, saveLocalProject } from "../../lib/localProjectStore";
 
 import { SongCanvas } from "../../features/song-canvas/components/SongCanvas";
 import { getArrangementRenderCount } from "../../features/song-canvas/components/arrangementMetrics";
@@ -53,6 +40,8 @@ declare global {
       resume: () => Promise<void>;
       seek: (position: number) => void;
       stop: () => void;
+      installSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
+      replaceSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
       snapshot: () => {
         audioContextCurrentTime: number;
           transport: ReturnType<typeof getTransportSnapshot>;
@@ -91,7 +80,15 @@ export function AppShell() {
   }));
 
   const cancelCurrentJob = useRef<(() => void) | null>(null);
-  const separatedSections = useRef<SeparatedSection[]>([]);
+  const activeImport = useRef(0);
+  const [processingMessage, setProcessingMessage] = useState("");
+  const [processingProgress, setProcessingProgress] = useState<number | null>(null);
+
+  useEffect(() => () => {
+    activeImport.current++;
+    cancelCurrentJob.current?.();
+    audioEngine.stop();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -103,7 +100,7 @@ export function AppShell() {
       if (cancelled || getProjectState().file) return;
       const restoredState = {
         ...saved.project.state,
-        segmentSize: saved.project.state.segmentSize ?? "1bar" as const,
+        segmentSize: saved.project.state.segmentSize ?? "4bars" as const,
         status: saved.sections.length ? "ready" as const : "imported" as const,
       };
       restoreProjectSnapshot(file, audio, restoredState, saved.sections);
@@ -112,16 +109,16 @@ export function AppShell() {
       const savedSectionsCoverTimeline = saved.sections.length > 0 && saved.sections[0].startSample === 0 &&
         saved.sections.at(-1)?.endSample === expectedEndSample &&
         saved.sections.every((section, index) => index === 0 || saved.sections[index - 1].endSample === section.startSample);
-      const needsDefaultOneBarRegroup = savedSectionsCoverTimeline &&
+      const needsDefaultFourBarRegroup = savedSectionsCoverTimeline &&
         saved.project.state.masterTimeline !== null && saved.project.state.masterTimeline !== undefined &&
         saved.project.state.segmentSize === undefined;
       let regroupedOnRestore = false;
-      if (needsDefaultOneBarRegroup) {
+      if (needsDefaultFourBarRegroup) {
         try {
-          await changeArrangementSegmentSize("1bar", true);
+          await changeArrangementSegmentSize("4bars", true);
           regroupedOnRestore = true;
         } catch (error) {
-          console.warn("Could not convert saved sections to one-bar segments", error);
+          console.warn("Could not convert saved sections to four-bar segments", error);
         }
       }
       if (!regroupedOnRestore) {
@@ -167,26 +164,46 @@ export function AppShell() {
     project.timelineCorrections, project.beatSnapMode, project.segmentSize, project.downbeatPhaseOffsetSamples,
     project.sections, project.status]);
 
-  async function handleBackendSeparation(strategy: AnalysisStrategy, beatsPerBar: number, report: (message: string) => void) {
-    if (!project.file || !project.audio) throw new Error("Import audio before starting HTDemucs separation.");
-    cancelCurrentJob.current?.();
-    audioEngine.stop();
-    audioEngine.clearPreparedBuffers();
-    resetClips();
-    setSeparationPlan([]);
-    const handle = await startBackendSeparationFromFile(project.file, project.audio, strategy, {
-      onProgress: (event) => report(`${event.event ?? "job"}${event.progress === undefined ? "" : ` · ${Math.round(event.progress)}%`}${event.message ? ` · ${event.message}` : ""}`),
-      onError: (error) => { report(error.message); setProjectError(error.message); },
-      onComplete: () => report("Full stems and the shared beat grid are ready."),
-    }, beatsPerBar);
-    cancelCurrentJob.current = handle.close;
-    report(`HTDemucs job ${handle.jobId} is running.`);
-  }
-
   useEffect(() => {
     if (!import.meta.env.DEV || !new URLSearchParams(location.search).has("e2e")) {
       return;
     }
+
+    const installSyntheticProject = (timelineStart: number, durationSeconds: number) => {
+      audioEngine.stop();
+      audioEngine.clearPreparedBuffers();
+      resetClips();
+      const context = getAudioContext();
+      const sampleRate = context.sampleRate;
+      const startSample = Math.round(timelineStart * sampleRate);
+      const frameCount = Math.max(2, Math.round(durationSeconds * sampleRate));
+      const stems = Object.fromEntries(([
+        ["drums", 70], ["bass", 110], ["other", 220], ["vocals", 440],
+      ] as const).map(([stem, frequency]) => {
+        const pcm = new Float32Array(frameCount);
+        for (let frame = 0; frame < frameCount; frame++) {
+          pcm[frame] = Math.sin(2 * Math.PI * frequency * frame / sampleRate) * 0.2;
+        }
+        return [stem, [pcm]];
+      })) as SeparatedSection["stems"];
+      const id = `e2e-${Math.random().toString(36).slice(2)}`;
+      const section: SeparatedSection = {
+        id,
+        index: 0,
+        startBar: 1,
+        endBar: 2,
+        startSample,
+        endSample: startSample + frameCount,
+        startTime: startSample / sampleRate,
+        endTime: (startSample + frameCount) / sampleRate,
+        sampleRate,
+        stems,
+      };
+      setArrangementSections([section], "4bars");
+      audioEngine.prepareSection(section);
+      registerSectionClips(section);
+      return Object.keys(getClipState().clips);
+    };
 
     window.__SONICLAB_E2E__ = {
       playArrangement: (position) => audioEngine.playArrangement(position),
@@ -196,6 +213,8 @@ export function AppShell() {
       resume: () => audioEngine.resume(),
       seek: (position) => audioEngine.seek(position),
       stop: () => audioEngine.stop(),
+      installSyntheticProject,
+      replaceSyntheticProject: installSyntheticProject,
       snapshot: () => ({
         audioContextCurrentTime: getAudioContext().currentTime,
         transport: getTransportSnapshot(),
@@ -227,12 +246,11 @@ export function AppShell() {
   }, []);
 
   function handleAudioLoaded(file: File, audio: AudioBuffer) {
-    // Cancel any previous analysis or separation job.
+    const importId = ++activeImport.current;
     cancelCurrentJob.current?.();
     cancelCurrentJob.current = null;
     audioEngine.stop();
     audioEngine.clearPreparedBuffers();
-    separatedSections.current = [];
     resetClips();
     void clearLocalProject().then(() => {
       const current = getProjectState();
@@ -241,200 +259,55 @@ export function AppShell() {
 
     // Save the original audio.
     setImportedAudio(file, audio);
-    setProjectStatus("analyzing");
-
-    // Analyze the original audio in a separate worker.
-    cancelCurrentJob.current = analyzeAudio(
-      audio.getChannelData(0),
-      audio.sampleRate,
-      4,
-      {
-        onStatus: (_stage, message) => {
-          console.info("[Audio Analysis]", message);
-        },
-
-        onComplete: (analysis) => {
-          try {
-            setAnalysisResult(analysis);
-
-            // Build downbeat-aligned separation sections.
-            const plan = buildSeparationPlan(
-              analysis,
-              audio.sampleRate,
-              4,
-              1,
-            );
-
-            setSeparationPlan(plan.sections);
-
-            console.info(
-              `[Separation] ${plan.totalSections} sections generated.`,
-            );
-
-            // Start processing one section at a time.
-            cancelCurrentJob.current = startSeparation({
-              audio,
-              sections: plan.sections,
-              backend: "wasm",
-
-              callbacks: {
-                onStatus: (section, message) => {
-                  console.info(
-                    `[${section.id}]`,
-                    message,
-                  );
-                },
-
-                onProgress: (section, percentage) => {
-                  setSectionProgress(
-                    section.id,
-                    percentage,
-                  );
-                },
-
-                onSectionComplete: (section) => {
-                  separatedSections.current.push(section);
-                  void saveLocalSection(section).catch((error: unknown) => console.warn("Could not save local audio section", error));
-                  // Keep progressive PCM results available while processing.
-                  // These sections follow the temporary import analysis grid;
-                  // do not expose them as playable arrangement clips until
-                  // drum analysis establishes the authoritative final grid.
-                  addSeparatedSection(section);
-
-                  console.info(`[Separation] Completed ${section.id}`);
-                },
-
-                onComplete: () => {
-                  // Analyze the separated drums at their original sample
-                  // offsets. This is the authoritative musical grid used to
-                  // assemble the final arrangement for every stem.
-                  const drumReference = new Float32Array(audio.length);
-                  for (const section of separatedSections.current) {
-                    const channels = section.stems.drums;
-                    const expectedLength = section.endSample - section.startSample;
-                    if (!channels?.length || channels[0].length !== expectedLength) {
-                      setProjectError(`Drum timing samples are invalid in ${section.id}.`);
-                      cancelCurrentJob.current = null;
-                      return;
-                    }
-                    drumReference.set(
-                      channels[0],
-                      section.startSample,
-                    );
-                  }
-
-                  cancelCurrentJob.current = analyzeAudio(
-                    drumReference,
-                    audio.sampleRate,
-                    4,
-                    {
-                      onStatus: (_stage, message) => {
-                        console.info("[Drums Master Analysis]", message);
-                      },
-                      onComplete: (drumAnalysis) => {
-                        try {
-                          const masterPlan = buildSeparationPlan(
-                            drumAnalysis,
-                            audio.sampleRate,
-                            4,
-                            1,
-                          );
-                          const masterSections = assembleMasterTimelineSections(
-                            separatedSections.current,
-                            masterPlan.sections,
-                            audio.sampleRate,
-                          );
-
-                          audioEngine.stop();
-                          audioEngine.clearPreparedBuffers();
-                          resetClips();
-                          setMasterTimelineSections(
-                            drumAnalysis,
-                            masterPlan.sections,
-                            masterSections,
-                          );
-                          separatedSections.current = [];
-                          for (const section of masterSections) {
-                            audioEngine.prepareSection(section);
-                            registerSectionClips(section);
-                          }
-                          void clearLocalSections().then(() => Promise.all(masterSections.map(saveLocalSection)))
-                            .catch((error: unknown) => console.warn("Could not persist finalized audio sections", error));
-                          finishSeparation();
-                          cancelCurrentJob.current = null;
-
-                          console.info("[Drums Master Timeline] assembled", {
-                            bpm: drumAnalysis.bpm,
-                            beatCount: drumAnalysis.beats.length,
-                            downbeatCount: drumAnalysis.downbeats.length,
-                            sectionCount: masterSections.length,
-                            sampleRate: audio.sampleRate,
-                            originSample: 0,
-                            maxStemBoundaryErrorSamples: Math.max(
-                              0,
-                              ...masterSections.flatMap((section) => [
-                                ...(["drums", "bass", "other", "vocals"] as const)
-                                  .map((stem) => Math.abs(
-                                    section.stems[stem][0].length -
-                                    (section.endSample - section.startSample),
-                                  )),
-                              ]),
-                            ),
-                          });
-                        } catch (error) {
-                          const message = error instanceof Error
-                            ? error.message
-                            : String(error);
-                          setProjectError(message);
-                          cancelCurrentJob.current = null;
-                        }
-                      },
-                      onError: (message) => {
-                        setProjectError(`Drums master analysis failed: ${message}`);
-                        cancelCurrentJob.current = null;
-                      },
-                    },
-                  );
-                },
-
-                onError: (section, message) => {
-                  setSectionError(section.id, message);
-                  setProjectError(message);
-                  cancelCurrentJob.current = null;
-
-                  console.error(
-                    `[Separation] ${section.id}`,
-                    message,
-                  );
-                },
-              },
-            });
-          } catch (error) {
-            const message =
-              error instanceof Error
-                ? error.message
-                : String(error);
-
-            setProjectError(message);
-            cancelCurrentJob.current = null;
-
-            console.error("[Audio Pipeline]", error);
-          }
-        },
-
-        onError: (message) => {
-          setProjectError(message);
-          cancelCurrentJob.current = null;
-
-          console.error("[Audio Analysis]", message);
-        },
+    setProjectStatus("separating");
+    setProcessingMessage("Uploading audio…");
+    setProcessingProgress(null);
+    const controller = new AbortController();
+    cancelCurrentJob.current = () => controller.abort();
+    void startBackendSeparationFromFile(file, audio, "drums_first", {
+      onProgress: (event) => {
+        if (activeImport.current !== importId) return;
+        const stage = event.stage ?? event.event ?? event.status ?? "Processing";
+        const progress = typeof event.progress === "number" && Number.isFinite(event.progress)
+          ? Math.max(0, Math.min(100, event.progress))
+          : null;
+        setProcessingProgress(progress);
+        setProcessingMessage(`${stage}${event.message ? ` · ${event.message}` : ""}`);
       },
-    );
+      onError: (error) => {
+        if (activeImport.current !== importId || controller.signal.aborted) return;
+        setProcessingMessage(error.message);
+        setProcessingProgress(null);
+        setProjectError(error.message);
+      },
+      onComplete: () => {
+        if (activeImport.current !== importId) return;
+        setProcessingMessage("Stems and beat grid are ready.");
+        setProcessingProgress(100);
+        cancelCurrentJob.current = null;
+      },
+    }, 4, controller.signal).then((handle) => {
+      if (activeImport.current !== importId || controller.signal.aborted) {
+        handle.close();
+        return;
+      }
+      cancelCurrentJob.current = () => {
+        controller.abort();
+        handle.close();
+      };
+      setProcessingMessage(`Processing job ${handle.jobId}`);
+    }).catch((error: unknown) => {
+      if (activeImport.current !== importId || controller.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      setProcessingMessage(message);
+      setProcessingProgress(null);
+      setProjectError(message);
+    });
   }
 
   return (
     <div className="app-shell">
-      <SongCanvas onBackendSeparation={handleBackendSeparation} />
+      <SongCanvas processingMessage={processingMessage} processingProgress={processingProgress} />
 
       {!project.audio && (
         <div className="app-shell__import-overlay">

@@ -419,6 +419,8 @@ function TrackColumn({
   sampleRate,
   snapMode,
   snapTargets,
+  processing,
+  processingProgress,
 }: {
   type: TrackType;
   clips: AudioClip[];
@@ -431,6 +433,8 @@ function TrackColumn({
   sampleRate: number;
   snapMode: BeatSnapMode;
   snapTargets: number[];
+  processing: boolean;
+  processingProgress: number | null;
 }) {
   const stem = type as StemName;
 
@@ -464,6 +468,17 @@ function TrackColumn({
               className="arrangement-row"
               key={row}
             >
+              {processing && row === 1 && rowClips.length === 0 && (
+                <div
+                  className={`arrangement-processing-clip arrangement-processing-clip--${type}`}
+                  aria-label={`${TRACK_LABELS[type]} stem processing`}
+                  data-testid={`processing-track-${type}`}
+                >
+                  {processingProgress !== null && (
+                    <span style={{ width: `${processingProgress}%` }} />
+                  )}
+                </div>
+              )}
               {projectMarkerSection(sections, clipsByRow, row, beats, downbeats, sampleRate, snapMode, snapTargets)}
               {rowClips.map((clip) => {
                 const section = sections[clip.sectionId];
@@ -526,7 +541,11 @@ function projectMarkerSection(
 /**
  * Main arrangement grid.
  */
-export function ArrangementGrid() {
+export function ArrangementGrid({
+  processingProgress,
+}: {
+  processingProgress: number | null;
+}) {
   markArrangementRender();
   const project = useProjectStoreSelector((state) => ({
     sections: state.sections,
@@ -536,6 +555,7 @@ export function ArrangementGrid() {
     timelineCorrections: state.timelineCorrections,
     downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
     beatSnapMode: state.beatSnapMode,
+    status: state.status,
   }));
   const clipState = useClipStore();
   const transport = useTransportStore();
@@ -608,6 +628,8 @@ export function ArrangementGrid() {
             sampleRate={markerGrid?.sampleRate ?? 0}
             snapMode={project.beatSnapMode}
             snapTargets={snapTargets}
+            processing={project.status === "separating"}
+            processingProgress={processingProgress}
           />
         ))}
       </div>

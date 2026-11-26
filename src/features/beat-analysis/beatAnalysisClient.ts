@@ -1,4 +1,3 @@
-import { apiUrl } from "../../lib/api";
 export type BeatAnalysisEvent = {
   time_seconds: number;
   sample_position: number;

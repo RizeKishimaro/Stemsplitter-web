@@ -108,9 +108,9 @@ test("full-stem backend beat-grid slicing uses identical integer frame boundarie
       metadata: null,
     },
   };
-  const sections = buildSectionsFromBeatGrid("job-1", grid, stems);
+  const sections = buildSectionsFromBeatGrid("job-1", grid, stems, "1bar");
   expect(sections).toHaveLength(4);
-  expect(buildSectionSchedule("job-1", 10, 10, [], [2, 5, 8], "4bars", 4)).toHaveLength(2);
+  expect(buildSectionSchedule("job-1", 10, 10, [], [2, 5, 8])).toHaveLength(2);
   expect(sections.map(({ startSample, endSample }) => [startSample, endSample])).toEqual([[0, 2], [2, 5], [5, 8], [8, 10]]);
   for (const section of sections) {
     expect(section.endSample - section.startSample).toBe(section.stems.drums[0].length);
@@ -216,7 +216,7 @@ test("successful job loads analysisUrl and project stem URLs without requesting 
     return new Response("Not found", { status: 404 });
   };
 
-  const loaded = await fetchSuccessfulJobAudio(job, fetcher);
+  const loaded = await fetchSuccessfulJobAudio(job, fetcher, undefined, "1bar");
   expect(loaded.grid).toEqual(grid);
   expect(loaded.sections.map(({ startSample, endSample }) => [startSample, endSample])).toEqual([[0, 4], [4, 8]]);
   expect(requests).toContain(`/api/v1/jobs/${jobId}/analysis`);

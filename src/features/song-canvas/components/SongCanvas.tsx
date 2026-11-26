@@ -1,10 +1,6 @@
-
-
 import { useState } from "react";
 import { useProjectStoreSelector, setBeatSnapMode, setDownbeatPhaseOffsetSamples } from "../../../stores/project.store";
-import { setExternalBeatMarkerGrid } from "../../../stores/project.store";
-import { runBackendBeatAnalysis } from "../../beat-analysis/beatAnalysisClient";
-import { changeArrangementSegmentSize, type AnalysisStrategy, type ArrangementSegmentSize } from "../../../lib/backendSeparationClient";
+import { changeArrangementSegmentSize, type ArrangementSegmentSize } from "../../../lib/backendSeparationClient";
 import { GridBackground } from "./GridBackground";
 import { TrackHeader, type TrackType } from "./TrackHeader";
 import { ArrangementGrid } from "./ArrangementGrid";
@@ -12,63 +8,29 @@ import { ArrangementGrid } from "./ArrangementGrid";
 import "./SongCanvas.css";
 import "./TrackHeader.css";
 
-const trackTypes: TrackType[] = [
-  "drums",
-  "bass",
-  "other",
-  "vocals",
-];
+const trackTypes: TrackType[] = ["drums", "bass", "other", "vocals"];
 
-type SongCanvasProps = { onBackendSeparation: (strategy: AnalysisStrategy, beatsPerBar: number, report: (message: string) => void) => Promise<void> };
+type SongCanvasProps = {
+  processingMessage: string;
+  processingProgress: number | null;
+};
 
-export function SongCanvas({ onBackendSeparation }: SongCanvasProps) {
-  const [separationJobId, setSeparationJobId] = useState("");
-  const [analysisBusy, setAnalysisBusy] = useState(false);
-  const [analysisMessage, setAnalysisMessage] = useState("");
-  const [analysisStrategy, setAnalysisStrategy] = useState<AnalysisStrategy>("drums_first");
-  const [beatsPerBar, setBeatsPerBar] = useState(4);
-  const [backendBusy, setBackendBusy] = useState(false);
+export function SongCanvas({ processingMessage, processingProgress }: SongCanvasProps) {
+  const [settingsMessage, setSettingsMessage] = useState("");
   const project = useProjectStoreSelector((state) => ({
     file: state.file,
-    audio: state.audio,
     masterTimeline: state.masterTimeline,
     beatSnapMode: state.beatSnapMode,
     downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
     segmentSize: state.segmentSize,
+    status: state.status,
+    error: state.error,
   }));
-
-  async function handleBackendAnalysis() {
-    if (!separationJobId.trim()) return;
-    setAnalysisBusy(true);
-    setAnalysisMessage("Analyzing drums…");
-    try {
-      const result = await runBackendBeatAnalysis(separationJobId.trim());
-      setExternalBeatMarkerGrid(result);
-      const bpm = result.bpm === null ? "BPM unavailable" : `${result.bpm.toFixed(1)} BPM`;
-      setAnalysisMessage(`${bpm} · ${result.beats.length} beats · ${result.downbeats.length} downbeats · ${result.detection_engine} ${result.engine_version}`);
-    } catch (error) {
-      setAnalysisMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setAnalysisBusy(false);
-    }
-  }
-
-  async function handleBackendSeparation() {
-    setBackendBusy(true);
-    setAnalysisMessage("Uploading audio to HTDemucs…");
-    try {
-      await onBackendSeparation(analysisStrategy, beatsPerBar, setAnalysisMessage);
-    } catch (error) {
-      setAnalysisMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBackendBusy(false);
-    }
-  }
 
   return (
     <section className="song-canvas">
       <GridBackground />
-      <div className="beat-grid-tools" aria-label="Beat grid editing">
+      <div className="beat-grid-tools" aria-label="Timeline settings">
         <label>
           <span>Snap</span>
           <select
@@ -91,8 +53,8 @@ export function SongCanvas({ onBackendSeparation }: SongCanvasProps) {
             onChange={(event) => {
               const segmentSize = event.target.value as ArrangementSegmentSize;
               void changeArrangementSegmentSize(segmentSize)
-                .then(() => setAnalysisMessage(`Arrangement re-sliced to ${segmentSize === "beat" ? "one beat" : segmentSize.replace("bars", " bars").replace("bar", " bar")} per segment.`))
-                .catch((error: unknown) => setAnalysisMessage(error instanceof Error ? error.message : String(error)));
+                .then(() => setSettingsMessage(`Arrangement updated to ${segmentLabel(segmentSize)}.`))
+                .catch((error: unknown) => setSettingsMessage(error instanceof Error ? error.message : String(error)));
             }}
           >
             <option value="1bar">1 bar</option>
@@ -121,66 +83,46 @@ export function SongCanvas({ onBackendSeparation }: SongCanvasProps) {
           />
           <span>ms</span>
         </label>
-        <form
-          className="beat-grid-tools__backend"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void handleBackendAnalysis();
-          }}
-        >
-          <label>
-            <span>HTDemucs job</span>
-            <input
-              aria-label="HTDemucs separation job ID"
-              type="text"
-              value={separationJobId}
-              onChange={(event) => setSeparationJobId(event.target.value)}
-              placeholder="job UUID"
-              disabled={analysisBusy}
-            />
-          </label>
-          <button type="submit" disabled={analysisBusy || !project.masterTimeline || !separationJobId.trim()}>
-            {analysisBusy ? "Analyzing…" : "Analyze drums"}
-          </button>
-        </form>
-        {project.file && project.audio && <div className="beat-grid-tools__backend">
-          <label>
-            <span>HTDemucs analysis</span>
-            <select aria-label="HTDemucs analysis strategy" value={analysisStrategy} disabled={backendBusy}
-              onChange={(event) => setAnalysisStrategy(event.target.value as AnalysisStrategy)}>
-              <option value="drums_first">Drums first</option>
-              <option value="mix_first">Mix first</option>
-            </select>
-          </label>
-          <label>
-            <span>Meter</span>
-            <select aria-label="Analysis time signature" value={beatsPerBar} disabled={backendBusy}
-              onChange={(event) => setBeatsPerBar(Number(event.target.value))}>
-              <option value={4}>4/4</option>
-              <option value={3}>3/4</option>
-            </select>
-          </label>
-          <button type="button" disabled={backendBusy} onClick={() => void handleBackendSeparation()}>
-            {backendBusy ? "Connecting…" : "Separate with HTDemucs"}
-          </button>
-        </div>}
-        {analysisMessage && <span className="beat-grid-tools__message" role="status">{analysisMessage}</span>}
+        <span className="beat-grid-tools__defaults" aria-label="Processing defaults">
+          4/4 · Drums lead
+        </span>
+        {settingsMessage && <span className="beat-grid-tools__message" role="status">{settingsMessage}</span>}
       </div>
 
-      <div className="song-canvas__content">
-        {/* Fixed track headers */}
-        <div className="song-canvas__tracks">
-          {trackTypes.map((type) => (
-            <TrackHeader key={type} type={type} />
-          ))}
+      {project.status === "separating" && (
+        <div className="song-canvas__processing" role="status" aria-live="polite">
+          <span>{processingMessage || "Processing audio…"}</span>
+          {processingProgress !== null && (
+            <>
+              <progress max={100} value={processingProgress} aria-label="Backend processing progress" />
+              <span>{Math.round(processingProgress)}%</span>
+            </>
+          )}
         </div>
+      )}
+      {project.status === "error" && project.error && (
+        <div className="song-canvas__processing song-canvas__processing--error" role="alert">
+          {project.error}
+        </div>
+      )}
 
+      <div className="song-canvas__content">
+        <div className="song-canvas__tracks">
+          {trackTypes.map((type) => <TrackHeader key={type} type={type} />)}
+        </div>
         <div className="arrangement-scroll">
           <div className="arrangement-scroll__content">
-            <ArrangementGrid />
+            <ArrangementGrid
+              processingProgress={processingProgress}
+            />
           </div>
         </div>
       </div>
     </section>
   );
+}
+
+function segmentLabel(size: ArrangementSegmentSize) {
+  if (size === "beat") return "one beat per segment";
+  return `${size[0]} ${size[0] === "1" ? "bar" : "bars"} per segment`;
 }

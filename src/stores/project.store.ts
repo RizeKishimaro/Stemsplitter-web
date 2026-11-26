@@ -80,7 +80,7 @@ const initialState: ProjectState = {
   timelineCorrections: {},
   beatSnapMode: "off",
   downbeatPhaseOffsetSamples: 0,
-  segmentSize: "1bar",
+  segmentSize: "4bars",
   sections: [],
   completedSections: {},
   sectionProgress: {},
@@ -259,7 +259,7 @@ export function setBackendBeatTimeline(
     };
   },
   sections: SeparatedSection[],
-  segmentSize: ArrangementSegmentSize = "1bar",
+  segmentSize: ArrangementSegmentSize = "4bars",
 ) {
   const { sampleRate, frames } = grid.audio;
   if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0) {

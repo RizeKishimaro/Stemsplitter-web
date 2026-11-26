@@ -2,9 +2,10 @@
 
 .audio-import {
   position: relative;
-  width: 584px;
-  height: 404px;
+  width: 585px;
+  height: 405px;
   flex: 0 0 auto;
+  box-sizing: border-box;
 
   display: flex;
   align-items: center;
@@ -127,8 +128,7 @@
 
 @media (max-width: 640px) {
   .audio-import {
-    width: calc(100vw - 32px);
-    height: min(404px, calc(100svh - 48px));
+    width: min(585px, calc(100vw - 45px));
+    height: min(405px, calc(100svh - 45px));
   }
 }
-

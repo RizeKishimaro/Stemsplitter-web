@@ -19,6 +19,11 @@
   justify-content: center;
 
   pointer-events: none;
+  background-color: #f1e9dc;
+  background-image: url("../../features/song-canvas/assets/grid-tile.svg");
+  background-size: 45px 45px;
+  background-position: center center;
+  background-repeat: repeat;
 }
 
 .app-shell__import-overlay .audio-import {
@@ -42,4 +47,3 @@ body,
   min-height: 0;
   overflow: hidden;
 }
-

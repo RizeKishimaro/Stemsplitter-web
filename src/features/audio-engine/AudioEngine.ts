@@ -52,6 +52,8 @@ class AudioEngine {
 
   private animationFrame = 0;
   private generation = 0;
+  private requestSequence = 0;
+  private pendingClipRequests = new Map<string, number>();
   private globallyPaused = false;
 
   /** Prepare each section once, as it arrives from the separation worker. */
@@ -118,6 +120,19 @@ class AudioEngine {
         stem: source.stem,
         effectiveGain: this.effectiveStemGain(source.stem),
       })),
+      activeSchedules: [...this.sourceSchedules].map(([clipId, schedule]) => {
+        const clip = getClipState().clips[clipId];
+        const sampleRate = clip ? this.getClipBuffer(clip)?.sampleRate ?? 0 : 0;
+        return {
+          clipId,
+          scheduledContextTime: schedule.scheduledTime,
+          sourceOffsetSeconds: schedule.sourceOffset,
+          sourceOffsetSamples: Math.round(schedule.sourceOffset * sampleRate),
+          sourceStartSeconds: schedule.sourceStart,
+          sourceEndSeconds: schedule.sourceEnd,
+          looping: schedule.loop,
+        };
+      }),
       preparedBuffers: [...this.preparedBuffers].map(([key, buffer]) => ({
         key,
         sampleRate: buffer.sampleRate,
@@ -191,19 +206,31 @@ class AudioEngine {
     const clip = { ...storedClip, loopEnabled: enabled };
 
     const sourceOffset = this.getCurrentSourceOffset(clipId);
+    const wasLocalPlayback = this.localPlaybackClipIds.has(clipId);
     const context = getAudioContext();
     const scheduledTime = context.currentTime + 0.03;
     const generation = this.generation;
     this.stopSource(clipId);
-    this.localPlaybackClipIds.add(clipId);
+    if (wasLocalPlayback) this.localPlaybackClipIds.add(clipId);
+    else this.localPlaybackClipIds.delete(clipId);
     this.scheduleClip(
       clip,
-      this.getPosition(),
+      wasLocalPlayback
+        ? this.getPosition()
+        : this.getPosition() + (scheduledTime - context.currentTime),
       scheduledTime,
       generation,
-      "clip-local",
-      sourceOffset,
+      wasLocalPlayback ? "clip-local" : "timeline",
+      wasLocalPlayback
+        ? sourceOffset + (scheduledTime - context.currentTime)
+        : undefined,
     );
+    if (!this.sources.has(clipId)) {
+      this.activeClipIds.delete(clipId);
+      this.localPlaybackClipIds.delete(clipId);
+      this.pausedLocalOffsets.delete(clipId);
+      this.syncTransport();
+    }
   }
 
   private scheduleClip(
@@ -262,6 +289,8 @@ class AudioEngine {
     let sourceOffset = scheduleMode === "clip-local"
       ? clipLocalOffset ?? sourceStart
       : mappedSource!.sourceOffsetSeconds;
+
+    if (!Number.isFinite(sourceOffset) || sourceOffset < sourceStart || sourceOffset > buffer.duration) return;
 
     // If the playhead has passed this clip, only a looping clip
     // can continue from its wrapped position.
@@ -432,12 +461,13 @@ class AudioEngine {
       if (this.globallyPaused) return;
 
       const position = this.getPosition();
-
-      publishTransportFrame(Math.min(position, this.duration));
+      const hasLoopingSource = [...this.sourceSchedules.values()].some((schedule) => schedule.loop);
+      publishTransportFrame(hasLoopingSource ? position : Math.min(position, this.duration));
 
       if (
         this.mode === "arrangement" &&
-        position >= this.duration
+        position >= this.duration &&
+        !hasLoopingSource
       ) {
         this.stop();
         return;
@@ -495,7 +525,21 @@ class AudioEngine {
     if (this.activeClipIds.has(clipId)) return;
 
     const requestTime = getAudioContext().currentTime;
-    const context = await resumeAudioContext();
+    const generation = this.generation;
+    const requestId = ++this.requestSequence;
+    this.pendingClipRequests.set(clipId, requestId);
+    let context: AudioContext;
+    try {
+      context = await resumeAudioContext();
+    } catch (error) {
+      if (this.pendingClipRequests.get(clipId) === requestId) this.pendingClipRequests.delete(clipId);
+      throw error;
+    }
+
+    // A new project, stop, seek, or newer click invalidates this asynchronous
+    // request. A late AudioContext.resume() must never revive a replaced track.
+    if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
+    this.pendingClipRequests.delete(clipId);
 
     // AudioContext resume is asynchronous. Re-read the clip and buffer after
     // it completes so scheduling uses current project state and source range.
@@ -576,6 +620,7 @@ class AudioEngine {
   }
 
   pauseClip(clipId: string) {
+    this.pendingClipRequests.delete(clipId);
     if (!this.activeClipIds.has(clipId)) return;
 
     if (this.localPlaybackClipIds.has(clipId)) {
@@ -606,7 +651,9 @@ class AudioEngine {
 
     if (!clips.length) return;
 
+    const requestGeneration = this.generation;
     await resumeAudioContext();
+    if (requestGeneration !== this.generation) return;
 
     this.stop();
     this.localPlaybackClipIds.clear();
@@ -669,6 +716,9 @@ class AudioEngine {
   async resume() {
     if (this.mode === null || !this.globallyPaused) return;
 
+    const generationBeforeResume = this.generation;
+    await resumeAudioContext();
+    if (generationBeforeResume !== this.generation || this.mode === null || !this.globallyPaused) return;
 
     this.globallyPaused = false;
     this.beginTimeline(this.pausedPosition);
@@ -762,6 +812,7 @@ class AudioEngine {
 
   stop() {
     this.generation++;
+    this.pendingClipRequests.clear();
     this.cancelClock();
     this.stopAllSources();
     this.localPlaybackClipIds.clear();
