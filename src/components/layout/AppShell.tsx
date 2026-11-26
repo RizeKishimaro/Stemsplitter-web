@@ -16,7 +16,7 @@ import {
 } from "../../features/stem-separation/separationPlan";
 import { startSeparation } from "../../features/stem-separation/separationScheduler";
 import { audioEngine } from "../../features/audio-engine/AudioEngine";
-import { recoverBackendChunks, startBackendSeparationFromFile, type AnalysisStrategy } from "../../lib/backendSeparationClient";
+import { changeArrangementSegmentSize, recoverBackendJob, startBackendSeparationFromFile, type AnalysisStrategy } from "../../lib/backendSeparationClient";
 import { getAudioContext } from "../../features/audio-engine/AudioContextManager";
 import { getTransportSnapshot } from "../../stores/transport.store";
 import type { SeparatedSection } from "../../features/stem-separation/separationScheduler";
@@ -84,6 +84,7 @@ export function AppShell() {
     beatMarkerGrid: state.beatMarkerGrid,
     timelineCorrections: state.timelineCorrections,
     beatSnapMode: state.beatSnapMode,
+    segmentSize: state.segmentSize,
     downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
     sections: state.sections,
     status: state.status,
@@ -102,19 +103,40 @@ export function AppShell() {
       if (cancelled || getProjectState().file) return;
       const restoredState = {
         ...saved.project.state,
+        segmentSize: saved.project.state.segmentSize ?? "1bar" as const,
         status: saved.sections.length ? "ready" as const : "imported" as const,
       };
       restoreProjectSnapshot(file, audio, restoredState, saved.sections);
       restoreClipSnapshot(saved.project.clips);
-      for (const section of saved.sections) audioEngine.prepareSection(section);
-      for (const section of saved.sections) registerSectionClips(section);
-      if (saved.project.backendJobId) {
-        void recoverBackendChunks(saved.project.backendJobId, recoveryController.signal)
+      const expectedEndSample = saved.project.state.sections.at(-1)?.endSample;
+      const savedSectionsCoverTimeline = saved.sections.length > 0 && saved.sections[0].startSample === 0 &&
+        saved.sections.at(-1)?.endSample === expectedEndSample &&
+        saved.sections.every((section, index) => index === 0 || saved.sections[index - 1].endSample === section.startSample);
+      const needsDefaultOneBarRegroup = savedSectionsCoverTimeline &&
+        saved.project.state.masterTimeline !== null && saved.project.state.masterTimeline !== undefined &&
+        saved.project.state.segmentSize === undefined;
+      let regroupedOnRestore = false;
+      if (needsDefaultOneBarRegroup) {
+        try {
+          await changeArrangementSegmentSize("1bar", true);
+          regroupedOnRestore = true;
+        } catch (error) {
+          console.warn("Could not convert saved sections to one-bar segments", error);
+        }
+      }
+      if (!regroupedOnRestore) {
+        for (const section of saved.sections) audioEngine.prepareSection(section);
+        for (const section of saved.sections) registerSectionClips(section);
+      }
+      const hasCompleteLocalStemSet = saved.project.state.sections.length > 0 &&
+        saved.sections.length >= saved.project.state.sections.length;
+      if (saved.project.backendJobId && !hasCompleteLocalStemSet) {
+        void recoverBackendJob(saved.project.backendJobId, recoveryController.signal)
           .catch((error: unknown) => {
             if (recoveryController.signal.aborted) return;
             const message = error instanceof Error ? error.message : String(error);
-            setProjectError(`Could not recover backend chunks: ${message}`);
-            console.warn("Could not recover backend chunks", error);
+            setProjectError(`Could not restore backend stems and beat grid: ${message}`);
+            console.warn("Could not restore backend stems and beat grid", error);
           });
       }
     }).catch((error: unknown) => console.warn("Could not restore local DubPad project", error));
@@ -142,7 +164,7 @@ export function AppShell() {
       if (timer) clearTimeout(timer);
     };
   }, [project.file, project.audio, project.analysis, project.masterTimeline, project.beatMarkerGrid,
-    project.timelineCorrections, project.beatSnapMode, project.downbeatPhaseOffsetSamples,
+    project.timelineCorrections, project.beatSnapMode, project.segmentSize, project.downbeatPhaseOffsetSamples,
     project.sections, project.status]);
 
   async function handleBackendSeparation(strategy: AnalysisStrategy, beatsPerBar: number, report: (message: string) => void) {
@@ -155,7 +177,7 @@ export function AppShell() {
     const handle = await startBackendSeparationFromFile(project.file, project.audio, strategy, {
       onProgress: (event) => report(`${event.event ?? "job"}${event.progress === undefined ? "" : ` · ${Math.round(event.progress)}%`}${event.message ? ` · ${event.message}` : ""}`),
       onError: (error) => { report(error.message); setProjectError(error.message); },
-      onComplete: () => report("All synchronized HTDemucs chunks are ready."),
+      onComplete: () => report("Full stems and the shared beat grid are ready."),
     }, beatsPerBar);
     cancelCurrentJob.current = handle.close;
     report(`HTDemucs job ${handle.jobId} is running.`);

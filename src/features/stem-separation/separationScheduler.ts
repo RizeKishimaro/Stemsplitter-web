@@ -13,6 +13,7 @@ export type SeparatedSection = {
   startSample: number;
   endSample: number;
   sampleRate: number;
+  kind?: SeparationSection["kind"];
   stems: Record<StemName, Float32Array[]>;
 };
 

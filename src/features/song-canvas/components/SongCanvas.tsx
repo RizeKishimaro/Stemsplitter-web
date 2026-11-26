@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useProjectStoreSelector, setBeatSnapMode, setDownbeatPhaseOffsetSamples } from "../../../stores/project.store";
 import { setExternalBeatMarkerGrid } from "../../../stores/project.store";
 import { runBackendBeatAnalysis } from "../../beat-analysis/beatAnalysisClient";
-import type { AnalysisStrategy } from "../../../lib/backendSeparationClient";
+import { changeArrangementSegmentSize, type AnalysisStrategy, type ArrangementSegmentSize } from "../../../lib/backendSeparationClient";
 import { GridBackground } from "./GridBackground";
 import { TrackHeader, type TrackType } from "./TrackHeader";
 import { ArrangementGrid } from "./ArrangementGrid";
@@ -34,6 +34,7 @@ export function SongCanvas({ onBackendSeparation }: SongCanvasProps) {
     masterTimeline: state.masterTimeline,
     beatSnapMode: state.beatSnapMode,
     downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
+    segmentSize: state.segmentSize,
   }));
 
   async function handleBackendAnalysis() {
@@ -79,6 +80,25 @@ export function SongCanvas({ onBackendSeparation }: SongCanvasProps) {
             <option value="off">Off</option>
             <option value="beat">Beat</option>
             <option value="bar">Bar</option>
+          </select>
+        </label>
+        <label>
+          <span>Segment</span>
+          <select
+            aria-label="Arrangement segment size"
+            value={project.segmentSize}
+            disabled={!project.masterTimeline}
+            onChange={(event) => {
+              const segmentSize = event.target.value as ArrangementSegmentSize;
+              void changeArrangementSegmentSize(segmentSize)
+                .then(() => setAnalysisMessage(`Arrangement re-sliced to ${segmentSize === "beat" ? "one beat" : segmentSize.replace("bars", " bars").replace("bar", " bar")} per segment.`))
+                .catch((error: unknown) => setAnalysisMessage(error instanceof Error ? error.message : String(error)));
+            }}
+          >
+            <option value="1bar">1 bar</option>
+            <option value="2bars">2 bars</option>
+            <option value="4bars">4 bars</option>
+            <option value="beat">1 beat</option>
           </select>
         </label>
         <label>

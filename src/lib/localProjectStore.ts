@@ -8,7 +8,7 @@ const ACTIVE_PROJECT_ID = ACTIVE_LOCAL_PROJECT_ID;
 
 type PersistedProjectState = Pick<ProjectState,
   "analysis" | "masterTimeline" | "beatMarkerGrid" | "timelineCorrections" |
-  "beatSnapMode" | "downbeatPhaseOffsetSamples" | "sections" | "status">;
+  "beatSnapMode" | "downbeatPhaseOffsetSamples" | "segmentSize" | "sections" | "status">;
 
 export type LocalProjectRecord = {
   id: typeof ACTIVE_PROJECT_ID;
@@ -83,6 +83,7 @@ export async function saveLocalProject(file: File, state: ProjectState, clips: R
           timelineCorrections: state.timelineCorrections,
           beatSnapMode: state.beatSnapMode,
           downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
+          segmentSize: state.segmentSize,
           sections: state.sections,
           status: state.status,
         },
@@ -240,6 +241,20 @@ export async function saveLocalSection(section: SeparatedSection) {
   const database = await openDb();
   try {
     await requestResult(database.transaction("sections", "readwrite").objectStore("sections").put({ id: section.id, section } satisfies LocalSectionRecord));
+  } finally {
+    database.close();
+  }
+}
+
+/** Replace cached derived section PCM while keeping project and job metadata intact. */
+export async function replaceLocalSections(sections: SeparatedSection[]) {
+  const database = await openDb();
+  try {
+    const transaction = database.transaction("sections", "readwrite");
+    const store = transaction.objectStore("sections");
+    store.clear();
+    for (const section of sections) store.put({ id: section.id, section } satisfies LocalSectionRecord);
+    await transactionDone(transaction);
   } finally {
     database.close();
   }

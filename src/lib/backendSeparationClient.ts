@@ -1,60 +1,448 @@
 import { API_BASE_URL } from "./api";
 import { audioEngine } from "../features/audio-engine/AudioEngine";
+import type { SeparationSection, StemName } from "../features/stem-separation/chunkEngine";
 import type { SeparatedSection } from "../features/stem-separation/separationScheduler";
-import { registerSectionClips } from "../stores/clip.store";
-import { addSeparatedSection, finishSeparation, setBackendChunkSchedule, setExternalBeatMarkerGrid, setProjectStatus, setSectionProgress } from "../stores/project.store";
-import type { BeatAnalysisResult } from "../features/beat-analysis/beatAnalysisClient";
+import { assembleMasterTimelineSections } from "../features/stem-separation/separationPlan";
+import { getClipState, registerSectionClips, resetClips, setClipLoop } from "../stores/clip.store";
 import {
-  deleteLocalChunkStem,
-  getLocalChunkRecord,
-  getLocalChunkStem,
-  markLocalChunkPersisted,
-  persistLocalChunkStem,
-  saveBackendJobId,
-  ACTIVE_LOCAL_PROJECT_ID,
-  type LocalChunkManifest,
-} from "./localProjectStore";
+  finishSeparation,
+  getProjectState,
+  setArrangementSections,
+  setBackendBeatTimeline,
+  setProjectError,
+  setProjectStatus,
+  setSegmentSizePreference,
+} from "../stores/project.store";
+import { replaceLocalSections, saveBackendJobId, saveLocalSection } from "./localProjectStore";
 
 export type AnalysisStrategy = "mix_first" | "drums_first";
-const BACKEND_API_BASE = (import.meta.env?.VITE_RUST_API_URL ?? API_BASE_URL).replace(/\/+$/, "");
+const BACKEND_API_BASE = API_BASE_URL;
+const STEM_NAMES = ["drums", "bass", "other", "vocals"] as const;
+export type ArrangementSegmentSize = "1bar" | "2bars" | "4bars" | "beat";
 
-export type BackendChunkCompleted = {
-  job_id: string;
-  chunk_id: string;
-  chunk_index: number;
-  bar_number: number | null;
-  start_seconds: number;
-  end_seconds: number;
-  duration_seconds: number;
-  source_sample_start: number;
-  source_sample_end: number;
-  sample_rate: number;
-  stems: Record<"drums" | "bass" | "other" | "vocals", { url: string; channels: number; sample_rate: number; frame_count: number; audio_format: "wav"; sha256: string; byte_length: number }>;
-  status: "COMPLETED";
+export type BeatGridEvent = { timeSeconds: number; samplePosition: number; bar?: number };
+export type BeatGrid = {
+  schemaVersion: number;
+  jobId: string;
+  projectId: string;
+  audio: {
+    sampleRate: number;
+    channels: number;
+    frames: number;
+    durationSeconds: number;
+    samplePositionUnit: "frames";
+    stems: Record<StemName, string>;
+  };
+  analysis: {
+    engine: string;
+    engineVersion: string | null;
+    modelVersion: string | null;
+    inputStem: string;
+    bpm: number | null;
+    beatsPerBar: number;
+    beats: BeatGridEvent[];
+    downbeats: BeatGridEvent[];
+    metadata: unknown;
+  };
+};
+
+export type BackendJob = {
+  id: string;
+  project_id: string;
+  status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+  progress: number;
+  error_message: string | null;
+  result_metadata: {
+    projectId?: string;
+    analysisUrl?: string;
+    stems?: Partial<Record<StemName, { url?: string; sampleRate?: number; channels?: number; frames?: number }>>;
+  };
+};
+
+type ProjectStem = {
+  name: StemName;
+  audioUrl: string;
+  sampleRate: number;
+  channels: number;
+  frames: number;
+  durationSeconds: number;
+  fileSizeBytes: number;
+};
+
+type BackendProject = {
+  project: { id: string };
+  stems: ProjectStem[];
 };
 
 type BackendEvent = {
   event?: string;
+  stage?: string;
   status?: string;
   progress?: number;
   message?: string;
-  chunk?: BackendChunkCompleted | {
-    analysis: BeatAnalysisResult & { sample_rate: number };
-    boundaries: Array<{ index: number; bar_number: number | null; start_sample: number; end_sample: number; sample_rate: number }>;
-  };
+  job_id?: string;
 };
 
 export type BackendSeparationCallbacks = {
-  onChunk?: (section: SeparatedSection, metadata: BackendChunkCompleted) => void;
   onProgress?: (event: BackendEvent) => void;
-  onComplete?: (manifest: unknown[]) => void;
+  onComplete?: () => void;
   onError?: (error: Error) => void;
 };
 
 function apiUrl(path: string) {
-  const base = BACKEND_API_BASE.startsWith("http") ? BACKEND_API_BASE : `${window.location.origin}${BACKEND_API_BASE}`;
+  const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const base = BACKEND_API_BASE.startsWith("http") ? BACKEND_API_BASE : `${origin}${BACKEND_API_BASE}`;
+  if (/^https?:\/\//i.test(path)) return path;
   if (path.startsWith("/")) return new URL(path, new URL(base).origin).toString();
   return new URL(path.replace(/^\/+/, ""), `${base.replace(/\/$/, "")}/`).toString();
+}
+
+async function responseJson<T>(response: Response, message: string): Promise<T> {
+  if (!response.ok) throw new Error(`${message} (${response.status}): ${await response.text()}`);
+  return response.json() as Promise<T>;
+}
+
+export function decodeStemWav(bytes: ArrayBuffer, expected: Pick<ProjectStem, "name" | "sampleRate" | "channels" | "frames">): Float32Array[] {
+  const view = new DataView(bytes);
+  const fourcc = (offset: number) => String.fromCharCode(
+    view.getUint8(offset), view.getUint8(offset + 1), view.getUint8(offset + 2), view.getUint8(offset + 3),
+  );
+  if (view.byteLength < 44 || fourcc(0) !== "RIFF" || fourcc(8) !== "WAVE") {
+    throw new Error(`${expected.name} stem is not a valid RIFF/WAVE file.`);
+  }
+
+  let format = 0;
+  let channels = 0;
+  let sampleRate = 0;
+  let bitsPerSample = 0;
+  let blockAlign = 0;
+  let dataOffset = -1;
+  let dataBytes = 0;
+  for (let offset = 12; offset + 8 <= view.byteLength;) {
+    const id = fourcc(offset);
+    const size = view.getUint32(offset + 4, true);
+    const body = offset + 8;
+    if (body + size > view.byteLength) throw new Error(`${expected.name} WAV data is truncated.`);
+    if (id === "fmt ") {
+      format = view.getUint16(body, true);
+      channels = view.getUint16(body + 2, true);
+      sampleRate = view.getUint32(body + 4, true);
+      blockAlign = view.getUint16(body + 12, true);
+      bitsPerSample = view.getUint16(body + 14, true);
+    } else if (id === "data") {
+      dataOffset = body;
+      dataBytes = size;
+    }
+    offset = body + size + (size & 1);
+  }
+
+  const bytesPerSample = bitsPerSample / 8;
+  const supportedPcm = format === 1 && [8, 16, 24, 32].includes(bitsPerSample);
+  const supportedFloat = format === 3 && bitsPerSample === 32;
+  if ((!supportedPcm && !supportedFloat) || sampleRate !== expected.sampleRate ||
+    channels !== expected.channels || channels < 1 || blockAlign !== channels * bytesPerSample ||
+    dataOffset < 0 || dataBytes !== expected.frames * blockAlign ||
+    dataOffset + dataBytes !== view.byteLength) {
+    throw new Error(`${expected.name} WAV format or source frame metadata does not match the project manifest.`);
+  }
+
+  const output = Array.from({ length: channels }, () => new Float32Array(expected.frames));
+  for (let frame = 0; frame < expected.frames; frame++) {
+    for (let channel = 0; channel < channels; channel++) {
+      const position = dataOffset + frame * blockAlign + channel * bytesPerSample;
+      let sample: number;
+      if (supportedFloat) sample = view.getFloat32(position, true);
+      else if (bitsPerSample === 8) sample = (view.getUint8(position) - 128) / 128;
+      else if (bitsPerSample === 16) sample = view.getInt16(position, true) / 32768;
+      else if (bitsPerSample === 24) {
+        let value = view.getUint8(position) | (view.getUint8(position + 1) << 8) | (view.getUint8(position + 2) << 16);
+        if (value & 0x800000) value |= 0xff000000;
+        sample = value / 8_388_608;
+      } else sample = view.getInt32(position, true) / 2_147_483_648;
+      output[channel][frame] = sample;
+    }
+  }
+  return output;
+}
+
+export function buildSectionSchedule(
+  jobId: string,
+  sampleRate: number,
+  frames: number,
+  beatSamples: number[],
+  downbeatSamples: number[],
+  segmentSize: ArrangementSegmentSize = "1bar",
+  beatsPerBar = 4,
+): SeparationSection[] {
+  if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0 ||
+    !Number.isInteger(beatsPerBar) || beatsPerBar <= 0) {
+    throw new Error("Invalid source timeline for section generation.");
+  }
+  const sourceBoundaries = segmentSize === "beat"
+    ? beatSamples
+    : completeMissingDownbeats(beatSamples, downbeatSamples, beatsPerBar);
+  for (const sample of sourceBoundaries) {
+    if (!Number.isSafeInteger(sample) || sample < 0 || sample > frames) {
+      throw new Error("Musical marker is outside the source frame timeline.");
+    }
+  }
+  const markers = sourceBoundaries
+    .filter((sample) => sample < frames)
+    .slice()
+    .sort((a, b) => a - b)
+    .filter((sample, index, all) => index === 0 || sample !== all[index - 1]);
+  const groupSize = segmentSize === "beat" ? 1 : Number(segmentSize[0]);
+  const ranges: Array<{ start: number; end: number; startBar: number; endBar: number; kind: SeparationSection["kind"] }> = [];
+  if (!markers.length) {
+    ranges.push({ start: 0, end: frames, startBar: 0, endBar: 0, kind: "bars" });
+  } else {
+    if (markers[0] > 0) ranges.push({ start: 0, end: markers[0], startBar: 0, endBar: 0, kind: "pickup" });
+    for (let index = 0; index < markers.length; index++) {
+      ranges.push({
+        start: markers[index],
+        end: markers[index + 1] ?? frames,
+        startBar: segmentSize === "beat" ? Math.floor(index / beatsPerBar) + 1 : index + 1,
+        endBar: segmentSize === "beat" ? Math.floor(index / beatsPerBar) + 1 : index + 1,
+        kind: "bars",
+      });
+    }
+  }
+
+  const grouped: typeof ranges = [];
+  for (let index = 0; index < ranges.length;) {
+    const first = ranges[index];
+    if (first.kind === "pickup") {
+      grouped.push(first);
+      index++;
+      continue;
+    }
+    const selected = ranges.slice(index, index + groupSize);
+    grouped.push({
+      start: selected[0].start,
+      end: selected[selected.length - 1].end,
+      startBar: selected[0].startBar,
+      endBar: selected[selected.length - 1].endBar,
+      kind: "bars",
+    });
+    index += selected.length;
+  }
+
+  return grouped.map((range, index) => {
+    const id = `${jobId.replaceAll("-", "")}-${segmentSize}-${String(index).padStart(6, "0")}`;
+    return {
+      id,
+      index,
+      startBar: range.startBar,
+      endBar: range.endBar,
+      startTime: range.start / sampleRate,
+      endTime: range.end / sampleRate,
+      startSample: range.start,
+      endSample: range.end,
+      processStartSample: range.start,
+      processEndSample: range.end,
+      trimStartSample: 0,
+      trimEndSample: range.end - range.start,
+      duration: (range.end - range.start) / sampleRate,
+      chunkIds: [`${id}:local`],
+      kind: range.kind,
+    };
+  });
+}
+
+/**
+ * Keep detected downbeats authoritative. If a downbeat is absent but the
+ * detector supplied a complete beat sequence between two detected downbeats,
+ * recover the missing bar starts from those integer beat frames. Incomplete
+ * or irregular beat sequences are left as-is rather than guessed from BPM.
+ */
+function completeMissingDownbeats(beatSamples: number[], downbeatSamples: number[], beatsPerBar: number) {
+  const downbeats = [...new Set(downbeatSamples)].sort((a, b) => a - b);
+  if (downbeats.length < 2) return downbeats;
+  const beats = [...new Set(beatSamples)].sort((a, b) => a - b);
+  const recovered: number[] = [];
+  for (let index = 0; index < downbeats.length - 1; index++) {
+    const start = downbeats[index];
+    const end = downbeats[index + 1];
+    const between = beats.filter((sample) => sample > start && sample < end);
+    if (between.length < beatsPerBar * 2 - 1 || (between.length + 1) % beatsPerBar !== 0) continue;
+    for (let beatIndex = beatsPerBar - 1; beatIndex < between.length; beatIndex += beatsPerBar) {
+      recovered.push(between[beatIndex]);
+    }
+  }
+  return [...new Set([...downbeats, ...recovered])].sort((a, b) => a - b);
+}
+
+export function buildSectionsFromBeatGrid(
+  jobId: string,
+  grid: BeatGrid,
+  stems: Record<StemName, Float32Array[]>,
+  segmentSize: ArrangementSegmentSize = "1bar",
+): SeparatedSection[] {
+  const { sampleRate, frames, channels, durationSeconds } = grid.audio;
+  if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0 ||
+    !Number.isSafeInteger(channels) || channels < 1 || durationSeconds !== frames / sampleRate) {
+    throw new Error("Beat grid has invalid source audio metadata.");
+  }
+  for (const name of STEM_NAMES) {
+    if (stems[name].length !== channels || stems[name].some((channel) => channel.length !== frames)) {
+      throw new Error(`${name} stem does not match the shared source sample timeline.`);
+    }
+  }
+
+  for (const event of [...grid.analysis.beats, ...grid.analysis.downbeats]) {
+    if (!Number.isSafeInteger(event.samplePosition) || event.samplePosition < 0 || event.samplePosition > frames ||
+      !Number.isFinite(event.timeSeconds) || Math.round(event.timeSeconds * sampleRate) !== event.samplePosition) {
+      throw new Error("Beat grid contains a timestamp that does not map to the original frame timeline.");
+    }
+  }
+  const schedule = buildSectionSchedule(jobId, sampleRate, frames,
+    grid.analysis.beats.map((beat) => beat.samplePosition),
+    grid.analysis.downbeats.map((beat) => beat.samplePosition), segmentSize, grid.analysis.beatsPerBar);
+  return schedule.map((section) => {
+    return {
+      ...section,
+      sampleRate,
+      stems: Object.fromEntries(STEM_NAMES.map((name) => [name, stems[name].map((channel) => channel.slice(section.startSample, section.endSample))])) as Record<StemName, Float32Array[]>,
+    };
+  });
+}
+
+/** Re-segment already loaded PCM locally; this performs no network requests. */
+export function regroupSectionsFromTimeline(
+  sections: SeparatedSection[],
+  sampleRate: number,
+  beatSamples: number[],
+  downbeatSamples: number[],
+  beatsPerBar: number,
+  segmentSize: ArrangementSegmentSize,
+): SeparatedSection[] {
+  const ordered = sections.slice().sort((left, right) => left.startSample - right.startSample);
+  const frames = ordered.at(-1)?.endSample ?? 0;
+  if (!ordered.length || !Number.isSafeInteger(sampleRate) || sampleRate <= 0 || frames <= 0) {
+    throw new Error("No complete local stem audio is available to re-segment.");
+  }
+  const schedule = buildSectionSchedule("local", sampleRate, frames, beatSamples, downbeatSamples, segmentSize, beatsPerBar);
+  const targets = schedule.map((section) => ({ ...section, sampleRate, stems: {} as SeparatedSection["stems"] }));
+  const assembled = assembleMasterTimelineSections(ordered, targets, sampleRate);
+  return assembled.map((section, index) => ({ ...section, kind: schedule[index].kind }));
+}
+
+/** Apply a segment-size change to the current arrangement without downloading stems again. */
+export async function changeArrangementSegmentSize(segmentSize: ArrangementSegmentSize, force = false) {
+  const project = getProjectState();
+  if (!force && project.segmentSize === segmentSize) return;
+  const sections = Object.values(project.completedSections);
+  if (!sections.length || !project.masterTimeline) {
+    setSegmentSizePreference(segmentSize);
+    return;
+  }
+  try {
+    const previousActiveClips = Object.values(getClipState().clips).filter((clip) => clip.active);
+    const regrouped = regroupSectionsFromTimeline(
+      sections,
+      project.masterTimeline.sampleRate,
+      project.masterTimeline.beatSamples,
+      project.masterTimeline.downbeatSamples,
+      project.masterTimeline.meter,
+      segmentSize,
+    );
+    await replaceLocalSections(regrouped);
+    audioEngine.stop();
+    audioEngine.clearPreparedBuffers();
+    resetClips();
+    setArrangementSections(regrouped, segmentSize);
+    for (const section of regrouped) {
+      audioEngine.prepareSection(section);
+      registerSectionClips(section);
+      for (const stem of STEM_NAMES) {
+        const previousClip = previousActiveClips
+          .filter((clip) => clip.stem === stem && clip.startTime < section.endTime && clip.endTime > section.startTime)
+          .sort((left, right) => Math.abs(left.startTime - section.startTime) - Math.abs(right.startTime - section.startTime))[0];
+        if (previousClip && !previousClip.loopEnabled) setClipLoop(`${stem}:${section.id}`, false);
+      }
+    }
+  } catch (error) {
+    setProjectError(error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+export async function fetchSuccessfulJobAudio(
+  job: BackendJob,
+  fetcher: typeof fetch = fetch,
+  signal?: AbortSignal,
+  segmentSize: ArrangementSegmentSize = "1bar",
+): Promise<{ grid: BeatGrid; sections: SeparatedSection[] }> {
+  if (job.status !== "SUCCEEDED") throw new Error(`Separation job is ${job.status.toLowerCase()}.`);
+  const metadataProjectId = job.result_metadata?.projectId;
+  if (!metadataProjectId || metadataProjectId !== job.project_id) {
+    throw new Error("Successful job metadata is missing its matching project ID.");
+  }
+  const analysisPath = job.result_metadata.analysisUrl;
+  if (!analysisPath) throw new Error("Successful job metadata has no analysisUrl.");
+
+  const [projectResponse, analysisResponse] = await Promise.all([
+    fetcher(apiUrl(`projects/${encodeURIComponent(metadataProjectId)}`), { signal }),
+    fetcher(apiUrl(analysisPath), { signal }),
+  ]);
+  const project = await responseJson<BackendProject>(projectResponse, "Could not load project metadata");
+  const grid = await responseJson<BeatGrid>(analysisResponse, "Could not load the saved beat grid");
+  if (project.project.id !== metadataProjectId || grid.projectId !== metadataProjectId || grid.jobId !== job.id ||
+    grid.audio.samplePositionUnit !== "frames") {
+    throw new Error("Project, job, and analysis metadata do not describe the same source timeline.");
+  }
+
+  const projectStems = new Map(project.stems.map((stem) => [stem.name, stem]));
+  const decoded = {} as Record<StemName, Float32Array[]>;
+  for (const stemName of STEM_NAMES) {
+    const projectStem = projectStems.get(stemName);
+    const jobStem = job.result_metadata.stems?.[stemName];
+    const beatGridUrl = grid.audio.stems[stemName];
+    if (!projectStem || !jobStem?.url || !beatGridUrl ||
+      projectStem.audioUrl !== jobStem.url || projectStem.audioUrl !== beatGridUrl ||
+      projectStem.sampleRate !== grid.audio.sampleRate || projectStem.channels !== grid.audio.channels ||
+      projectStem.frames !== grid.audio.frames || jobStem.sampleRate !== grid.audio.sampleRate ||
+      jobStem.channels !== grid.audio.channels || jobStem.frames !== grid.audio.frames) {
+      throw new Error(`${stemName} metadata does not match the shared beat-grid sample timeline.`);
+    }
+    const response = await fetcher(apiUrl(jobStem.url), { signal });
+    if (!response.ok) throw new Error(`Could not fetch the complete ${stemName} stem (${response.status}).`);
+    decoded[stemName] = decodeStemWav(await response.arrayBuffer(), {
+      name: stemName,
+      sampleRate: projectStem.sampleRate,
+      channels: projectStem.channels,
+      frames: projectStem.frames,
+    });
+  }
+
+  const sections = buildSectionsFromBeatGrid(job.id, grid, decoded, segmentSize);
+  return { grid, sections };
+}
+
+async function loadSuccessfulJob(job: BackendJob, signal?: AbortSignal): Promise<SeparatedSection[]> {
+  const segmentSize = getProjectState().segmentSize;
+  const { grid, sections } = await fetchSuccessfulJobAudio(job, fetch, signal, segmentSize);
+  audioEngine.stop();
+  audioEngine.clearPreparedBuffers();
+  resetClips();
+  setBackendBeatTimeline(grid, sections, segmentSize);
+  for (const section of sections) {
+    audioEngine.prepareSection(section);
+    registerSectionClips(section);
+  }
+  await Promise.all(sections.map(saveLocalSection));
+  finishSeparation();
+  return sections;
+}
+
+async function getJob(jobId: string, signal?: AbortSignal): Promise<BackendJob> {
+  return responseJson<BackendJob>(await fetch(apiUrl(`jobs/${encodeURIComponent(jobId)}`), { signal }), "Could not retrieve separation job");
+}
+
+function websocketUrl(path: string) {
+  const url = new URL(apiUrl(path));
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
 }
 
 export async function startBackendSeparationFromFile(
@@ -68,159 +456,18 @@ export async function startBackendSeparationFromFile(
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: file.name.replace(/\.[^.]+$/, "").slice(0, 200) || "DubPad Project" }),
   });
-  if (!projectResponse.ok) throw new Error(`Could not create backend project (${projectResponse.status}).`);
-  const project = await projectResponse.json() as { id: string };
+  const project = await responseJson<{ id: string }>(projectResponse, "Could not create backend project");
   const form = new FormData();
   form.set("file", file, file.name);
   form.set("sample_rate", String(audio.sampleRate));
   form.set("channels", String(audio.numberOfChannels));
   form.set("frame_count", String(audio.length));
   const uploadResponse = await fetch(apiUrl(`projects/${encodeURIComponent(project.id)}/audio`), { method: "POST", body: form });
-  if (!uploadResponse.ok) throw new Error(`Could not upload audio to HTDemucs (${uploadResponse.status}): ${await uploadResponse.text()}`);
-  const asset = await uploadResponse.json() as { id: string };
+  const asset = await responseJson<{ id: string }>(uploadResponse, "Could not upload audio for HTDemucs");
   return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar);
 }
 
-function websocketUrl(path: string) {
-  const url = new URL(apiUrl(path));
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.toString();
-}
-
-export async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-export function decodeFloatWav(
-  bytes: ArrayBuffer,
-  stem: string,
-  chunk: BackendChunkCompleted,
-): Float32Array[] {
-  const view = new DataView(bytes);
-  const fourcc = (offset: number) => String.fromCharCode(
-    view.getUint8(offset), view.getUint8(offset + 1), view.getUint8(offset + 2), view.getUint8(offset + 3),
-  );
-  if (view.byteLength < 44 || fourcc(0) !== "RIFF" || fourcc(8) !== "WAVE") {
-    throw new Error(`${stem} chunk is not a valid RIFF/WAVE file.`);
-  }
-  let format = 0;
-  let channels = 0;
-  let sampleRate = 0;
-  let bitsPerSample = 0;
-  let blockAlign = 0;
-  let dataOffset = -1;
-  let dataBytes = 0;
-  for (let offset = 12; offset + 8 <= view.byteLength;) {
-    const id = fourcc(offset);
-    const size = view.getUint32(offset + 4, true);
-    const body = offset + 8;
-    if (body + size > view.byteLength) throw new Error(`${stem} WAV chunk is truncated.`);
-    if (id === "fmt ") {
-      format = view.getUint16(body, true);
-      channels = view.getUint16(body + 2, true);
-      sampleRate = view.getUint32(body + 4, true);
-      blockAlign = view.getUint16(body + 12, true);
-      bitsPerSample = view.getUint16(body + 14, true);
-    } else if (id === "data") {
-      dataOffset = body;
-      dataBytes = size;
-    }
-    offset = body + size + (size & 1);
-  }
-  const expectedFrames = chunk.source_sample_end - chunk.source_sample_start;
-  const expectedChannels = chunk.stems[stem as keyof BackendChunkCompleted["stems"]]?.channels;
-  const expectedRate = chunk.stems[stem as keyof BackendChunkCompleted["stems"]]?.sample_rate ?? chunk.sample_rate;
-  if (format !== 3 || bitsPerSample !== 32 || sampleRate !== chunk.sample_rate ||
-      sampleRate !== expectedRate || channels < 1 || channels > 2 ||
-      (expectedChannels !== undefined && channels !== expectedChannels) || blockAlign !== channels * 4 ||
-      dataOffset < 0 || dataBytes !== expectedFrames * blockAlign ||
-      chunk.stems[stem as keyof BackendChunkCompleted["stems"]]?.frame_count !== expectedFrames ||
-      chunk.stems[stem as keyof BackendChunkCompleted["stems"]]?.audio_format !== "wav" ||
-      chunk.stems[stem as keyof BackendChunkCompleted["stems"]]?.byte_length !== bytes.byteLength) {
-    throw new Error(`${stem} WAV format or sample frame count does not match the chunk manifest.`);
-  }
-  const output = Array.from({ length: channels }, () => new Float32Array(expectedFrames));
-  for (let frame = 0; frame < expectedFrames; frame++) {
-    for (let channel = 0; channel < channels; channel++) {
-      output[channel][frame] = view.getFloat32(dataOffset + frame * blockAlign + channel * 4, true);
-    }
-  }
-  return output;
-}
-
-function chunkManifest(chunk: BackendChunkCompleted): LocalChunkManifest {
-  const section: Omit<SeparatedSection, "stems"> = {
-    id: chunk.chunk_id,
-    index: chunk.chunk_index,
-    startBar: chunk.bar_number ?? 0,
-    endBar: chunk.bar_number === null ? 0 : chunk.bar_number + 1,
-    startTime: chunk.start_seconds,
-    endTime: chunk.end_seconds,
-    startSample: chunk.source_sample_start,
-    endSample: chunk.source_sample_end,
-    sampleRate: chunk.sample_rate,
-  };
-  return { id: chunk.chunk_id, projectId: ACTIVE_LOCAL_PROJECT_ID, jobId: chunk.job_id, chunkIndex: chunk.chunk_index, section, stemMetadata: chunk.stems };
-}
-
-async function fetchAndPersistChunk(chunk: BackendChunkCompleted, signal?: AbortSignal): Promise<SeparatedSection> {
-  const metadata = chunkManifest(chunk);
-  const stems = {} as SeparatedSection["stems"];
-  for (const name of ["drums", "bass", "other", "vocals"] as const) {
-    const descriptor = chunk.stems[name];
-    if (!descriptor.sha256) throw new Error(`Server manifest does not include a ${name} checksum; rerun this job on the updated backend.`);
-    let existing = await getLocalChunkStem(chunk.chunk_id, name);
-    if (existing && await sha256Hex(await existing.blob.arrayBuffer()) !== descriptor.sha256) {
-      await deleteLocalChunkStem(chunk.chunk_id, name);
-      existing = undefined;
-    }
-    let blob: Blob;
-    let samples: Float32Array[];
-    if (existing) {
-      blob = existing.blob;
-      samples = decodeFloatWav(await blob.arrayBuffer(), name, chunk);
-    } else {
-      const response = await fetch(apiUrl(descriptor.url), { signal });
-      if (!response.ok) throw new Error(`Could not fetch ${name} chunk (${response.status}); retry is safe.`);
-      const bytes = await response.arrayBuffer();
-      const checksum = await sha256Hex(bytes);
-      if (checksum !== descriptor.sha256) throw new Error(`${name} chunk checksum mismatch; retry is safe.`);
-      samples = decodeFloatWav(bytes, name, chunk);
-      blob = new Blob([bytes], { type: "audio/wav" });
-      await persistLocalChunkStem(metadata, name, blob, checksum);
-    }
-    stems[name] = samples;
-  }
-  await markLocalChunkPersisted(chunk.chunk_id);
-  const checksums = Object.fromEntries(Object.entries(chunk.stems).map(([name, stem]) => [name, stem.sha256]));
-  let ackError: Error | undefined;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const ackResponse = await fetch(apiUrl(`jobs/${encodeURIComponent(chunk.job_id)}/chunks/${chunk.chunk_index}/ack`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chunk_id: chunk.chunk_id, checksums }),
-      });
-      if (ackResponse.ok) { ackError = undefined; break; }
-      ackError = new Error(`Chunk is stored locally, but server acknowledgement failed (${ackResponse.status}).`);
-    } catch (error) {
-      ackError = error instanceof Error ? error : new Error(String(error));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-  }
-  if (ackError) console.warn("[Chunk delivery] persisted chunk awaits acknowledgement recovery", { chunkId: chunk.chunk_id, error: ackError.message });
-  return { ...metadata.section, stems };
-}
-
-function activatePersistedChunk(section: SeparatedSection) {
-  addSeparatedSection(section);
-  audioEngine.prepareSection(section);
-  registerSectionClips(section);
-  setSectionProgress(section.id, 100);
-}
-
-/** Starts a Rust HTDemucs job and consumes completed four-stem chunks over WS + HTTP. */
+/** Starts HTDemucs and loads the persisted full stems and beat grid after completion. */
 export async function startBackendSeparation(
   projectId: string,
   audioAssetId: string,
@@ -233,169 +480,74 @@ export async function startBackendSeparation(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ audio_asset_id: audioAssetId, job_type: "separate", analysis_strategy: strategy, beats_per_bar: beatsPerBar }),
   });
-  if (!response.ok) throw new Error(`Could not create separation job (${response.status}): ${await response.text()}`);
-  const job = await response.json() as { id: string };
+  const job = await responseJson<BackendJob>(response, "Could not create separation job");
   await saveBackendJobId(job.id);
   setProjectStatus("separating");
+
   const socket = new WebSocket(websocketUrl(`jobs/${encodeURIComponent(job.id)}/events`));
-  let closed = false;
-  const seenChunks = new Set<string>();
-  const inFlightChunks = new Map<string, Promise<void>>();
-  const publishChunk = (chunk: BackendChunkCompleted): Promise<void> => {
-    if (seenChunks.has(chunk.chunk_id)) return Promise.resolve();
-    const existing = inFlightChunks.get(chunk.chunk_id);
-    if (existing) return existing;
-    const work = (async () => {
-      const section = await fetchAndPersistChunk(chunk);
-      activatePersistedChunk(section);
-      seenChunks.add(chunk.chunk_id);
-      callbacks.onChunk?.(section, chunk);
-    })();
-    const tracked = work.finally(() => inFlightChunks.delete(chunk.chunk_id));
-    inFlightChunks.set(chunk.chunk_id, tracked);
-    return tracked;
+  let manualClose = false;
+  let completed = false;
+  let completion: Promise<void> | undefined;
+  const complete = () => {
+    if (completion) return completion;
+    completion = (async () => {
+      let latest = await getJob(job.id);
+      while (latest.status === "QUEUED" || latest.status === "RUNNING") {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        latest = await getJob(job.id);
+      }
+      if (latest.status !== "SUCCEEDED") throw new Error(latest.error_message || `Separation job ${latest.status.toLowerCase()}.`);
+      await loadSuccessfulJob(latest);
+      completed = true;
+      callbacks.onComplete?.();
+      socket.close();
+    })().catch((error: unknown) => {
+      completion = undefined;
+      callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    });
+    void completion.catch(() => undefined);
+    return completion;
   };
-  let eventQueue = Promise.resolve();
+
   socket.onmessage = (message) => {
-    eventQueue = eventQueue.then(async () => {
+    try {
       const event = JSON.parse(String(message.data)) as BackendEvent;
       callbacks.onProgress?.(event);
-      if (event.event === "beat_analysis.completed" && event.chunk && "analysis" in event.chunk) {
-        setExternalBeatMarkerGrid(event.chunk.analysis, event.chunk.analysis.sample_rate);
-        setBackendChunkSchedule(job.id, event.chunk.boundaries);
-      }
-      if (event.event === "chunk.completed" && event.chunk && "status" in event.chunk && event.chunk.status === "COMPLETED") {
-        await publishChunk(event.chunk);
-      }
-      if (event.status === "SUCCEEDED" && !closed) {
-        closed = true;
-        const manifestResponse = await fetch(apiUrl(`jobs/${encodeURIComponent(job.id)}/chunks`));
-        if (!manifestResponse.ok) throw new Error("Could not retrieve final chunk manifest.");
-        const manifest = await manifestResponse.json() as Array<{
-          chunk_id: string; chunk_index: number; bar_number: number | null;
-          start_seconds: number; end_seconds: number; source_sample_start: number;
-          source_sample_end: number; sample_rate: number;
-          stem_metadata: BackendChunkCompleted["stems"];
-          client_persisted_at: string | null;
-        }>;
-        setBackendChunkSchedule(job.id, manifest.map((chunk) => ({
-          index: chunk.chunk_index,
-          bar_number: chunk.bar_number,
-          start_sample: chunk.source_sample_start,
-          end_sample: chunk.source_sample_end,
-          sample_rate: chunk.sample_rate,
-        })));
-        for (const row of manifest) {
-          const chunk: BackendChunkCompleted = {
-            job_id: job.id,
-            chunk_id: row.chunk_id,
-            chunk_index: row.chunk_index,
-            bar_number: row.bar_number,
-            start_seconds: row.start_seconds,
-            end_seconds: row.end_seconds,
-            duration_seconds: row.end_seconds - row.start_seconds,
-            source_sample_start: row.source_sample_start,
-            source_sample_end: row.source_sample_end,
-            sample_rate: row.sample_rate,
-            stems: row.stem_metadata,
-            status: "COMPLETED",
-          };
-          if (!seenChunks.has(chunk.chunk_id)) await publishChunk(chunk);
-        }
-        const analysisResponse = await fetch(apiUrl(`jobs/${encodeURIComponent(job.id)}/beat-analysis`));
-        if (analysisResponse.ok) {
-          const analysisJob = await analysisResponse.json() as { result: BeatAnalysisResult | null };
-          if (analysisJob.result) setExternalBeatMarkerGrid(analysisJob.result, analysisJob.result.sample_rate);
-        }
-        callbacks.onComplete?.(manifest);
-        finishSeparation();
-        socket.close();
-      } else if (["FAILED", "CANCELLED"].includes(event.status ?? "")) {
-        callbacks.onError?.(new Error(event.message || `Separation job ${event.status?.toLowerCase()}.`));
+      if (event.status === "SUCCEEDED") void complete().catch(() => undefined);
+      if (event.status === "FAILED" || event.status === "CANCELLED") {
+        manualClose = true;
+        callbacks.onError?.(new Error(event.message || `Separation job ${event.status.toLowerCase()}.`));
         socket.close();
       }
-    }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
+    } catch (error) {
+      callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
+    }
   };
   socket.onerror = () => callbacks.onError?.(new Error("Separation job WebSocket connection failed."));
   socket.onclose = () => {
-    if (closed) return;
-    void recoverBackendChunks(job.id)
-      .then((count) => {
-        if (closed) return;
-        closed = true;
-        callbacks.onProgress?.({ event: "chunks.recovered", message: `Recovered ${count} missing chunks from the server manifest.` });
-        callbacks.onComplete?.([]);
-      })
-      .catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
+    if (manualClose || completed || completion) return;
+    void recoverBackendJob(job.id).then(() => {
+      completed = true;
+      callbacks.onComplete?.();
+    }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
   };
-  return { jobId: job.id, close: () => { closed = true; socket.close(); } };
+  return { jobId: job.id, close: () => { manualClose = true; socket.close(); } };
 }
 
-/** Reconcile a saved project against a server manifest after a reload/reconnect. */
-export async function recoverBackendChunks(jobId: string, signal?: AbortSignal): Promise<number> {
-  let restored = 0;
-  let jobStatus: string = "RUNNING";
-  while (jobStatus === "RUNNING" || jobStatus === "QUEUED") {
-    const response = await fetch(apiUrl(`jobs/${encodeURIComponent(jobId)}/chunks`), { signal });
-    if (!response.ok) throw new Error(`Could not recover chunk manifest (${response.status}).`);
-    const manifest = await response.json() as Array<{
-      chunk_id: string; chunk_index: number; bar_number: number | null;
-      start_seconds: number; end_seconds: number; source_sample_start: number;
-      source_sample_end: number; sample_rate: number; stem_metadata: BackendChunkCompleted["stems"];
-      client_persisted_at: string | null;
-    }>;
-    for (const row of manifest) {
-    const chunk: BackendChunkCompleted = {
-      job_id: jobId,
-      chunk_id: row.chunk_id,
-      chunk_index: row.chunk_index,
-      bar_number: row.bar_number,
-      start_seconds: row.start_seconds,
-      end_seconds: row.end_seconds,
-      duration_seconds: row.end_seconds - row.start_seconds,
-      source_sample_start: row.source_sample_start,
-      source_sample_end: row.source_sample_end,
-      sample_rate: row.sample_rate,
-      stems: row.stem_metadata,
-      status: "COMPLETED",
-    };
-    const existing = await getLocalChunkRecord(chunk.chunk_id);
-    if (existing?.status === "CLIENT_PERSISTED" && existing.receivedStems.length === 4) {
-      if (row.client_persisted_at) continue;
-      // Re-acknowledge idempotently if a prior response was lost after the IDB commit.
-      const ack = await fetch(apiUrl(`jobs/${encodeURIComponent(jobId)}/chunks/${chunk.chunk_index}/ack`), {
-        method: "POST", signal, headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chunk_id: chunk.chunk_id, checksums: existing.checksums }),
-      });
-      if (!ack.ok) throw new Error(`Could not re-acknowledge saved chunk ${chunk.chunk_id} (${ack.status}).`);
-      continue;
-    }
-    const section = await fetchAndPersistChunk(chunk, signal);
-    activatePersistedChunk(section);
-    restored++;
-    }
-    const jobResponse = await fetch(apiUrl(`jobs/${encodeURIComponent(jobId)}`), { signal });
-    if (!jobResponse.ok) throw new Error(`Could not recover job state (${jobResponse.status}).`);
-    const job = await jobResponse.json() as { status: string };
-    jobStatus = job.status;
-    if (jobStatus === "RUNNING" || jobStatus === "QUEUED") {
-      await new Promise<void>((resolve, reject) => {
-        const timer = window.setTimeout(resolve, 1_500);
-        signal?.addEventListener("abort", () => {
-          window.clearTimeout(timer);
-          reject(new DOMException("Chunk recovery cancelled", "AbortError"));
-        }, { once: true });
-      });
-    }
+/** Restores a successful job from project and analysis metadata after reconnect or reload. */
+export async function recoverBackendJob(jobId: string, signal?: AbortSignal): Promise<number> {
+  let job = await getJob(jobId, signal);
+  while (job.status === "QUEUED" || job.status === "RUNNING") {
+    await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(resolve, 1_500);
+      signal?.addEventListener("abort", () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("Job recovery cancelled", "AbortError"));
+      }, { once: true });
+    });
+    job = await getJob(jobId, signal);
   }
-  if (jobStatus === "FAILED" || jobStatus === "CANCELLED") throw new Error(`Chunk recovery stopped because job is ${jobStatus.toLowerCase()}.`);
-  if (jobStatus === "SUCCEEDED") {
-    const analysisResponse = await fetch(apiUrl(`jobs/${encodeURIComponent(jobId)}/beat-analysis`), { signal });
-    if (analysisResponse.ok) {
-      const analysis = await analysisResponse.json() as { result: BeatAnalysisResult | null };
-      if (analysis.result) setExternalBeatMarkerGrid(analysis.result, analysis.result.sample_rate);
-    }
-    finishSeparation();
-  }
-  return restored;
+  if (job.status !== "SUCCEEDED") throw new Error(job.error_message || `Separation job is ${job.status.toLowerCase()}.`);
+  return (await loadSuccessfulJob(job, signal)).length;
 }

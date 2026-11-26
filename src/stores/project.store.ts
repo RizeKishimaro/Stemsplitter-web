@@ -24,7 +24,7 @@ export type ProjectStatus =
 export type MasterTimeline = {
   originSample: 0;
   sampleRate: number;
-  bpm: number;
+  bpm: number | null;
   meter: number;
   beatSamples: number[];
   downbeatSamples: number[];
@@ -36,6 +36,7 @@ export type MasterTimeline = {
 };
 
 export type BeatSnapMode = "off" | "beat" | "bar";
+export type ArrangementSegmentSize = "1bar" | "2bars" | "4bars" | "beat";
 
 export type BeatMarkerGrid = {
   sampleRate: number;
@@ -59,6 +60,7 @@ export type ProjectState = {
   timelineCorrections: Record<string, number>;
   beatSnapMode: BeatSnapMode;
   downbeatPhaseOffsetSamples: number;
+  segmentSize: ArrangementSegmentSize;
   sections: SeparationSection[];
 
   completedSections: Record<string, SeparatedSection>;
@@ -78,6 +80,7 @@ const initialState: ProjectState = {
   timelineCorrections: {},
   beatSnapMode: "off",
   downbeatPhaseOffsetSamples: 0,
+  segmentSize: "1bar",
   sections: [],
   completedSections: {},
   sectionProgress: {},
@@ -237,6 +240,118 @@ export function setExternalBeatMarkerGrid(result: BeatAnalysisResult, sourceSamp
       modelVersion: result.model_version,
       inputStem: result.input_stem,
     },
+  });
+}
+
+/** Apply the persisted backend beat grid without converting frame positions through seconds. */
+export function setBackendBeatTimeline(
+  grid: {
+    audio: { sampleRate: number; frames: number };
+    analysis: {
+      bpm: number | null;
+      beatsPerBar: number;
+      engine: string;
+      engineVersion: string | null;
+      modelVersion: string | null;
+      inputStem: string;
+      beats: Array<{ samplePosition: number }>;
+      downbeats: Array<{ samplePosition: number }>;
+    };
+  },
+  sections: SeparatedSection[],
+  segmentSize: ArrangementSegmentSize = "1bar",
+) {
+  const { sampleRate, frames } = grid.audio;
+  if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0) {
+    throw new Error("Backend beat grid has invalid source sample metadata.");
+  }
+  const beatSamples = grid.analysis.beats.map((beat) => beat.samplePosition);
+  const downbeatSamples = grid.analysis.downbeats.map((beat) => beat.samplePosition);
+  const bars = downbeatSamples
+    .filter((sample, index) => Number.isSafeInteger(sample) && sample >= 0 && sample < frames && (index === 0 || sample > downbeatSamples[index - 1]))
+    .map((startSample, index, starts) => ({
+      number: index + 1,
+      startSample,
+      endSample: starts[index + 1] ?? frames,
+    }));
+  const completedById = Object.fromEntries(sections.map((section) => [section.id, section]));
+  updateState({
+    masterTimeline: {
+      originSample: 0,
+      sampleRate,
+      bpm: grid.analysis.bpm,
+      meter: grid.analysis.beatsPerBar,
+      beatSamples,
+      downbeatSamples,
+      bars,
+    },
+    beatMarkerGrid: {
+      sampleRate,
+      bpm: grid.analysis.bpm,
+      beatSamples,
+      downbeatSamples,
+      engine: grid.analysis.engine,
+      engineVersion: grid.analysis.engineVersion ?? "unknown",
+      modelVersion: grid.analysis.modelVersion,
+      inputStem: grid.analysis.inputStem,
+    },
+    sections: sections.map((section) => ({
+      id: section.id,
+      index: section.index,
+      startBar: section.startBar,
+      endBar: section.endBar,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      startSample: section.startSample,
+      endSample: section.endSample,
+      processStartSample: section.startSample,
+      processEndSample: section.endSample,
+      trimStartSample: 0,
+      trimEndSample: section.endSample - section.startSample,
+      duration: section.endTime - section.startTime,
+      chunkIds: [section.id],
+      kind: section.kind ?? (section.startBar === 0 && section.endBar === 0 ? "pickup" : "bars"),
+    })),
+    segmentSize,
+    completedSections: completedById,
+    sectionProgress: Object.fromEntries(sections.map((section) => [section.id, 100])),
+    sectionErrors: {},
+    status: "separating",
+    error: null,
+  });
+}
+
+export function setSegmentSizePreference(segmentSize: ArrangementSegmentSize) {
+  updateState({ segmentSize });
+}
+
+/** Replace only the locally derived segmentation while retaining the shared beat grid. */
+export function setArrangementSections(sections: SeparatedSection[], segmentSize: ArrangementSegmentSize) {
+  const completedSections = Object.fromEntries(sections.map((section) => [section.id, section]));
+  updateState({
+    segmentSize,
+    sections: sections.map((section) => ({
+      id: section.id,
+      index: section.index,
+      startBar: section.startBar,
+      endBar: section.endBar,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      startSample: section.startSample,
+      endSample: section.endSample,
+      processStartSample: section.startSample,
+      processEndSample: section.endSample,
+      trimStartSample: 0,
+      trimEndSample: section.endSample - section.startSample,
+      duration: section.endTime - section.startTime,
+      chunkIds: [section.id],
+      kind: section.kind ?? "bars",
+    })),
+    completedSections,
+    sectionProgress: Object.fromEntries(sections.map((section) => [section.id, 100])),
+    sectionErrors: {},
+    status: "complete",
+    error: null,
   });
 }
 
