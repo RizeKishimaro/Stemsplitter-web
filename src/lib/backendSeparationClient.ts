@@ -435,6 +435,8 @@ export async function fetchSuccessfulJobAudio(
   signal?: AbortSignal,
   _segmentSize: ArrangementSegmentSize = "4bars",
 ): Promise<{ grid: BeatGrid; sections: SeparatedSection[] }> {
+  // Retained for API compatibility; server-published segments define the block size.
+  void _segmentSize;
   if (job.status !== "SUCCEEDED") throw new Error(`Separation job is ${job.status.toLowerCase()}.`);
   const projectId = job.result_metadata?.projectId;
   const analysisPath = job.result_metadata?.analysisUrl;
