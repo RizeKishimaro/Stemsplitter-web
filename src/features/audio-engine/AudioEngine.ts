@@ -45,6 +45,7 @@ class AudioEngine {
   private activeRemoteLoads = 0;
   private remoteLoadWaiters: Array<() => void> = [];
   private activeClipIds = new Set<string>();
+  private schedulingClipIds = new Set<string>();
   private localPlaybackClipIds = new Set<string>();
   private pausedLocalOffsets = new Map<string, number>();
   private mutedStems = new Set<StemName>();
@@ -403,7 +404,23 @@ class AudioEngine {
     });
   }
 
-  private async scheduleClip(
+  private scheduleClip(
+    clip: AudioClip,
+    timelinePosition: number,
+    startAt: number,
+    generation: number,
+    scheduleMode: "timeline" | "clip-local" = "timeline",
+    clipLocalOffset?: number,
+    startMeasurement?: { requestStartedAtMs: number; resumeDurationMs: number },
+  ): Promise<void> {
+    if (this.sources.has(clip.id) || this.schedulingClipIds.has(clip.id)) return Promise.resolve();
+    this.schedulingClipIds.add(clip.id);
+    return this.scheduleClipNow(
+      clip, timelinePosition, startAt, generation, scheduleMode, clipLocalOffset, startMeasurement,
+    ).finally(() => this.schedulingClipIds.delete(clip.id));
+  }
+
+  private async scheduleClipNow(
     clip: AudioClip,
     timelinePosition: number,
     startAt: number,
@@ -679,6 +696,20 @@ class AudioEngine {
         this.frameMetrics.frames++;
       }
       const position = this.getPosition();
+      if (this.mode === "arrangement") {
+        const context = getAudioContext();
+        const scheduleAt = context.currentTime + 0.05;
+        for (const clipId of this.activeClipIds) {
+          if (this.sources.has(clipId) || this.schedulingClipIds.has(clipId)) continue;
+          const clip = getClipState().clips[clipId];
+          if (!clip?.active || clip.endTime <= position || clip.startTime > position + 3) continue;
+          void this.scheduleClip(
+            clip, position, scheduleAt, generation, "timeline",
+          ).catch((error) => console.error("[Audio playback] Upcoming clip scheduling failed", {
+            clipId, stem: clip.stem, error,
+          }));
+        }
+      }
       const hasLoopingSource = [...this.sourceSchedules.values()].some((schedule) => schedule.loop);
       publishTransportFrame(hasLoopingSource ? position : Math.min(position, this.duration));
 
@@ -898,25 +929,19 @@ class AudioEngine {
 
 
     const playbackGeneration = this.generation;
-    await Promise.all(clips.map((clip) => this.scheduleClip(
-      clip,
-      fromTime,
-      this.contextStart,
-      playbackGeneration,
-      "timeline",
-      undefined,
+    // Prime only the first audible window. The clock will schedule later blocks
+    // as the playhead approaches them; never fetch/decode the entire song first.
+    const initialWindowEnd = fromTime + 3;
+    const initialClips = clips.filter((clip) =>
+      clip.endTime > fromTime && clip.startTime <= initialWindowEnd
+    );
+    await Promise.all(initialClips.map((clip) => this.scheduleClip(
+      clip, fromTime, this.contextStart, playbackGeneration, "timeline", undefined,
       { requestStartedAtMs, resumeDurationMs },
     )));
-
-    // Remote segment loads are asynchronous. Do not stop the transport just
-    // because no AudioBufferSourceNode exists yet; wait for all clip schedules.
     if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
     this.syncTransport();
-    if (this.sources.size > 0) {
-      this.startClock();
-    } else {
-      this.stop();
-    }
+    this.startClock();
   }
 
   pause() {
