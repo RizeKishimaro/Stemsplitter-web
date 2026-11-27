@@ -531,6 +531,69 @@ export async function startBackendSeparation(
   let completed = false;
   let completion: Promise<void> | undefined;
 
+  const pendingBarGroups = new Map<number, SeparatedSection[]>();
+  const publishedGroups = new Set<number>();
+  const barsPerPlaybackBlock = 4;
+
+  const publishGroupedSegments = (groupKey: number, segments: SeparatedSection[]) => {
+    const ordered = [...segments].sort((left, right) => left.startSample - right.startSample);
+    if (!ordered.length) return;
+    for (let index = 1; index < ordered.length; index++) {
+      if (ordered[index - 1].endSample !== ordered[index].startSample) {
+        console.warn("[Backend separation] Non-contiguous segments; leaving this group uncombined", {
+          groupKey, previous: ordered[index - 1].id, next: ordered[index].id,
+        });
+        ordered.forEach((section) => {
+          addServerSegment(section, getProjectState().segmentSize);
+          registerSectionClips(section);
+        });
+        return;
+      }
+    }
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    const serverStems: NonNullable<SeparatedSection["serverStems"]> = {};
+    for (const stem of STEM_NAMES) {
+      const firstSource = first.serverStems?.[stem];
+      if (!firstSource) return;
+      const parts = ordered.flatMap((section) => {
+        const source = section.serverStems?.[stem];
+        return source?.parts ?? [];
+      });
+      if (!parts.length || parts.some((part) => part.sampleRate !== firstSource.sampleRate ||
+        part.channels !== firstSource.channels)) return;
+      serverStems[stem] = {
+        parts,
+        sampleRate: firstSource.sampleRate,
+        channels: firstSource.channels,
+        frames: ordered.reduce((total, section) => total + (section.serverStems?.[stem]?.frames ?? 0), 0),
+        audioFormat: "wav",
+      };
+    }
+    const section: SeparatedSection = {
+      id: `block-${first.startSample}-${last.endSample}`,
+      index: first.index,
+      startBar: first.startBar,
+      endBar: last.endBar,
+      startTime: first.startTime,
+      endTime: last.endTime,
+      startSample: first.startSample,
+      endSample: last.endSample,
+      sampleRate: first.sampleRate,
+      kind: first.kind,
+      serverStems,
+      stems: { drums: [], bass: [], other: [], vocals: [] },
+    };
+    addServerSegment(section, getProjectState().segmentSize);
+    registerSectionClips(section);
+    publishedGroups.add(groupKey);
+    pendingBarGroups.delete(groupKey);
+  };
+
+  const flushPendingBarGroups = () => {
+    for (const [groupKey, segments] of pendingBarGroups) publishGroupedSegments(groupKey, segments);
+  };
+
   const publishServerSegment = (event: BackendEvent) => {
     const chunk = event.chunk;
     if (!chunk || chunk.projectId !== projectId || chunk.jobId !== job.id) return;
@@ -556,7 +619,13 @@ export async function startBackendSeparation(
       if (!descriptor || typeof descriptor.url !== "string" || descriptor.audioFormat !== "wav" ||
         number(descriptor.sampleRate) !== sampleRate || number(descriptor.channels) !== channels ||
         number(descriptor.frameCount) !== frameCount) continue;
-      serverStems[stem] = { url: apiUrl(descriptor.url), sampleRate, channels, frames: frameCount, audioFormat: "wav" };
+      serverStems[stem] = {
+        parts: [{
+          url: apiUrl(descriptor.url), sampleRate, channels, frames: frameCount,
+          startSample, endSample, audioFormat: "wav",
+        }],
+        sampleRate, channels, frames: frameCount, audioFormat: "wav",
+      };
     }
     if (STEM_NAMES.some((stem) => !serverStems[stem])) {
       console.warn("[Backend separation] Ignoring incomplete segment manifest", segmentId);
@@ -569,8 +638,17 @@ export async function startBackendSeparation(
       kind: barNumber === null ? "pickup" : "bars",
       serverStems, stems: { drums: [], bass: [], other: [], vocals: [] },
     };
-    addServerSegment(section, getProjectState().segmentSize);
-    registerSectionClips(section);
+    // Pickup material is not part of the bar grid; keep it as its own block.
+    if (barNumber === null) {
+      addServerSegment(section, getProjectState().segmentSize);
+      registerSectionClips(section);
+      return;
+    }
+    const groupKey = Math.floor(barNumber / barsPerPlaybackBlock);
+    const group = pendingBarGroups.get(groupKey) ?? [];
+    if (!group.some((item) => item.id === section.id)) group.push(section);
+    pendingBarGroups.set(groupKey, group);
+    if (group.length >= barsPerPlaybackBlock) publishGroupedSegments(groupKey, group);
   };
 
   const complete = () => {
@@ -582,7 +660,8 @@ export async function startBackendSeparation(
         latest = await getJob(job.id, signal);
       }
       if (latest.status !== "SUCCEEDED") throw new Error(latest.error_message || `Separation job ${latest.status.toLowerCase()}.`);
-      callbacks.onProgress?.({ stage: "LOADING_AUDIO", message: "Loading beat-grid metadata; segment audio stays on the server" });
+      flushPendingBarGroups();
+      callbacks.onProgress?.({ stage: "LOADING_AUDIO", message: "Loading beat-grid metadata and quantized 4-bar stem blocks" });
       await loadSuccessfulJob(latest, signal);
       completed = true;
       callbacks.onComplete?.();
