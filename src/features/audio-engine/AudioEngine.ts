@@ -39,6 +39,9 @@ class AudioEngine {
     loop: boolean;
   }>();
   private preparedBuffers = new Map<string, AudioBuffer>();
+  private remoteBufferLoads = new Map<string, Promise<AudioBuffer | null>>();
+  private remoteBufferKeys = new Set<string>();
+  private readonly maxRemoteBuffers = 24;
   private activeClipIds = new Set<string>();
   private localPlaybackClipIds = new Set<string>();
   private pausedLocalOffsets = new Map<string, number>();
@@ -123,6 +126,8 @@ class AudioEngine {
 
   clearPreparedBuffers() {
     this.preparedBuffers.clear();
+    this.remoteBufferLoads.clear();
+    this.remoteBufferKeys.clear();
   }
 
   /** Browser E2E diagnostics; production callers receive no PCM metadata. */
@@ -203,6 +208,48 @@ class AudioEngine {
     return this.preparedBuffers.get(`${clip.sectionId}:${clip.stem}`) ?? null;
   }
 
+  private async getClipBufferAsync(clip: AudioClip): Promise<AudioBuffer | null> {
+    const key = `${clip.sectionId}:${clip.stem}`;
+    const cached = this.preparedBuffers.get(key);
+    if (cached) {
+      if (this.remoteBufferKeys.has(key)) {
+        this.remoteBufferKeys.delete(key);
+        this.remoteBufferKeys.add(key);
+      }
+      return cached;
+    }
+    const source = getProjectState().completedSections[clip.sectionId]?.serverStems?.[clip.stem];
+    if (!source) return null;
+    const pending = this.remoteBufferLoads.get(key);
+    if (pending) return pending;
+
+    const load = (async () => {
+      const response = await fetch(source.url);
+      if (!response.ok) throw new Error(`Could not fetch ${clip.stem} segment ${clip.sectionId} (${response.status}).`);
+      const bytes = await response.arrayBuffer();
+      const buffer = await getAudioContext().decodeAudioData(bytes.slice(0));
+      if (buffer.sampleRate !== source.sampleRate || buffer.numberOfChannels !== source.channels ||
+        buffer.length !== source.frames) {
+        throw new Error(`Decoded ${clip.stem} segment metadata does not match its manifest.`);
+      }
+      this.preparedBuffers.set(key, buffer);
+      this.remoteBufferKeys.add(key);
+      while (this.remoteBufferKeys.size > this.maxRemoteBuffers) {
+        const oldest = this.remoteBufferKeys.values().next().value as string | undefined;
+        if (!oldest) break;
+        this.remoteBufferKeys.delete(oldest);
+        this.preparedBuffers.delete(oldest);
+      }
+      return buffer;
+    })();
+    this.remoteBufferLoads.set(key, load);
+    try {
+      return await load;
+    } finally {
+      if (this.remoteBufferLoads.get(key) === load) this.remoteBufferLoads.delete(key);
+    }
+  }
+
   private effectiveStemGain(stem: StemName): number {
     if (this.mutedStems.has(stem)) return 0;
     if (this.soloedStems.size > 0 && !this.soloedStems.has(stem)) return 0;
@@ -244,7 +291,7 @@ class AudioEngine {
     this.stopSource(clipId);
     if (wasLocalPlayback) this.localPlaybackClipIds.add(clipId);
     else this.localPlaybackClipIds.delete(clipId);
-    this.scheduleClip(
+    void this.scheduleClip(
       clip,
       wasLocalPlayback
         ? this.getPosition()
@@ -255,16 +302,17 @@ class AudioEngine {
       wasLocalPlayback
         ? sourceOffset + (scheduledTime - context.currentTime)
         : undefined,
-    );
-    if (!this.sources.has(clipId)) {
-      this.activeClipIds.delete(clipId);
-      this.localPlaybackClipIds.delete(clipId);
-      this.pausedLocalOffsets.delete(clipId);
-      this.syncTransport();
-    }
+    ).then(() => {
+      if (!this.sources.has(clipId) && generation === this.generation) {
+        this.activeClipIds.delete(clipId);
+        this.localPlaybackClipIds.delete(clipId);
+        this.pausedLocalOffsets.delete(clipId);
+        this.syncTransport();
+      }
+    });
   }
 
-  private scheduleClip(
+  private async scheduleClip(
     clip: AudioClip,
     timelinePosition: number,
     startAt: number,
@@ -274,14 +322,26 @@ class AudioEngine {
     startMeasurement?: { requestStartedAtMs: number; resumeDurationMs: number },
   ) {
     if (this.sources.has(clip.id)) return;
+    const requestContextTime = getAudioContext().currentTime;
 
     const clipDuration = clip.endTime - clip.startTime;
 
     if (clipDuration <= 0) return;
 
-    const buffer = this.getClipBuffer(clip);
-
-    if (!buffer) return;
+    let buffer = this.getClipBuffer(clip);
+    if (!buffer) {
+      try {
+        buffer = await this.getClipBufferAsync(clip);
+      } catch (error) {
+        console.error("[Audio playback] Could not load server segment:", error);
+        return;
+      }
+      if (!buffer || generation !== this.generation || this.sources.has(clip.id) || !getClipState().clips[clip.id]?.active) return;
+      const elapsed = Math.max(0, getAudioContext().currentTime - requestContextTime);
+      timelinePosition += elapsed;
+      startAt += elapsed;
+      if (scheduleMode === "clip-local" && clipLocalOffset !== undefined) clipLocalOffset += elapsed;
+    }
 
     const sourceStartSample = Math.max(0, clip.sourceStartSample);
     const sourceEndSample = Math.min(buffer.length, clip.sourceEndSample);
