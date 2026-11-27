@@ -46,6 +46,7 @@ class AudioEngine {
   private remoteLoadWaiters: Array<() => void> = [];
   private activeClipIds = new Set<string>();
   private schedulingClipIds = new Set<string>();
+  private schedulingSectionIds = new Set<string>();
   private localPlaybackClipIds = new Set<string>();
   private pausedLocalOffsets = new Map<string, number>();
   private mutedStems = new Set<StemName>();
@@ -741,17 +742,17 @@ class AudioEngine {
       }
       const position = this.getPosition();
       if (this.mode === "arrangement") {
-        const context = getAudioContext();
-        const scheduleAt = context.currentTime + 0.05;
+        const dueSections = new Set<string>();
         for (const clipId of this.activeClipIds) {
-          if (this.sources.has(clipId) || this.schedulingClipIds.has(clipId)) continue;
           const clip = getClipState().clips[clipId];
-          if (!clip?.active || clip.endTime <= position || clip.startTime > position + 3) continue;
-          void this.scheduleClip(
-            clip, position, scheduleAt, generation, "timeline",
-          ).catch((error) => console.error("[Audio playback] Upcoming clip scheduling failed", {
-            clipId, stem: clip.stem, error,
-          }));
+          if (!clip?.active || this.sources.has(clipId) || this.schedulingClipIds.has(clipId)) continue;
+          if (clip.endTime <= position || clip.startTime > position + 3) continue;
+          dueSections.add(clip.sectionId);
+        }
+        for (const sectionId of dueSections) {
+          void this.scheduleSection(sectionId, generation).catch((error) =>
+            console.error("[Audio playback] Synchronized section scheduling failed", { sectionId, error })
+          );
         }
       }
       const hasLoopingSource = [...this.sourceSchedules.values()].some((schedule) => schedule.loop);
@@ -770,6 +771,72 @@ class AudioEngine {
     };
 
     this.animationFrame = requestAnimationFrame(tick);
+  }
+
+  /**
+   * Schedule every active stem belonging to one musical section as a group.
+   * A section is never allowed to start one stem while another stem is still
+   * downloading/decoding. All sources share one AudioContext start timestamp
+   * and one master-timeline position.
+   */
+  private async scheduleSection(
+    sectionId: string,
+    generation: number,
+    leadSeconds = 0.05,
+  ): Promise<void> {
+    if (this.schedulingSectionIds.has(sectionId) || generation !== this.generation) return;
+    const clips = Object.values(getClipState().clips).filter((clip) =>
+      clip.active && clip.sectionId === sectionId && this.activeClipIds.has(clip.id) &&
+      !this.sources.has(clip.id)
+    );
+    if (!clips.length) return;
+
+    this.schedulingSectionIds.add(sectionId);
+    try {
+      const results = await Promise.all(clips.map(async (clip) => {
+        try {
+          const buffer = this.getClipBuffer(clip) ?? await this.getClipBufferAsync(clip);
+          return { clip, buffer };
+        } catch (error) {
+          console.error("[Audio playback] Stem section preload failed", {
+            sectionId, stem: clip.stem, clipId: clip.id, error,
+          });
+          return { clip, buffer: null };
+        }
+      }));
+      if (generation !== this.generation || this.globallyPaused || this.mode === null) return;
+
+      const ready = results.filter((item): item is { clip: AudioClip; buffer: AudioBuffer } =>
+        item.buffer !== null && item.clip.active
+      );
+      // Never start a partial stem group: one missing decode would recreate
+      // the exact audible phase drift this barrier is meant to prevent.
+      if (!ready.length || ready.length !== clips.length) return;
+
+      // One snapshot for the entire section group: never let each stem use
+      // its own fetch-completion time as a new timeline origin.
+      const context = getAudioContext();
+      const sharedTimelinePosition = this.getPosition();
+      const sharedStartAt = context.currentTime + leadSeconds;
+      await Promise.all(ready.map(({ clip }) => this.scheduleClip(
+        clip,
+        sharedTimelinePosition,
+        sharedStartAt,
+        generation,
+        "timeline",
+      )));
+      if (import.meta.env.DEV) {
+        console.debug("[Audio sync] section group scheduled", {
+          sectionId,
+          timelinePosition: sharedTimelinePosition,
+          audioContextStartAt: sharedStartAt,
+          stems: ready.map(({ clip }) => clip.stem),
+          sourceCount: ready.length,
+        });
+      }
+    } finally {
+      this.schedulingSectionIds.delete(sectionId);
+    }
   }
 
   private stopSource(clipId: string) {
@@ -944,16 +1011,13 @@ class AudioEngine {
   }
 
   async playArrangement(fromTime = 0) {
-    const requestStartedAtMs = performance.now();
     const clips = Object.values(getClipState().clips)
       .filter(clip => clip.active);
 
     if (!clips.length) return;
 
     const requestGeneration = this.generation;
-    const resumeStartedAtMs = performance.now();
     await resumeAudioContext();
-    const resumeDurationMs = performance.now() - resumeStartedAtMs;
     if (requestGeneration !== this.generation) return;
 
     this.stop();
@@ -989,11 +1053,10 @@ class AudioEngine {
     this.beginTimeline(fromTime);
     for (const clip of clips) this.activeClipIds.add(clip.id);
 
-    const sharedStartAt = this.contextStart;
-    await Promise.all(initialClips.map((clip) => this.scheduleClip(
-      clip, fromTime, sharedStartAt, playbackGeneration, "timeline", undefined,
-      { requestStartedAtMs, resumeDurationMs },
-    )));
+    const initialSectionIds = [...new Set(initialClips.map((clip) => clip.sectionId))];
+    await Promise.all(initialSectionIds.map((sectionId) =>
+      this.scheduleSection(sectionId, playbackGeneration, Math.max(0.05, this.contextStart - getAudioContext().currentTime))
+    ));
     if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
     this.syncTransport();
     this.startClock();
