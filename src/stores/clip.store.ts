@@ -104,7 +104,8 @@ export function registerSectionClips(
       splitDepth: 0,
 
       active: true,
-      loopEnabled: true,
+      // Arrangement sections play once by default; looping is an explicit clip action.
+      loopEnabled: false,
     };
 
     changed = true;
