@@ -809,7 +809,9 @@ class AudioEngine {
       const ready = results.filter((item): item is { clip: AudioClip; buffer: AudioBuffer } =>
         item.buffer !== null && item.clip.active
       );
-      if (!ready.length) return;
+      // Never start a partial stem group: one missing decode would recreate
+      // the exact audible phase drift this barrier is meant to prevent.
+      if (!ready.length || ready.length !== clips.length) return;
 
       // One snapshot for the entire section group: never let each stem use
       // its own fetch-completion time as a new timeline origin.
@@ -1009,16 +1011,13 @@ class AudioEngine {
   }
 
   async playArrangement(fromTime = 0) {
-    const requestStartedAtMs = performance.now();
     const clips = Object.values(getClipState().clips)
       .filter(clip => clip.active);
 
     if (!clips.length) return;
 
     const requestGeneration = this.generation;
-    const resumeStartedAtMs = performance.now();
     await resumeAudioContext();
-    const resumeDurationMs = performance.now() - resumeStartedAtMs;
     if (requestGeneration !== this.generation) return;
 
     this.stop();
