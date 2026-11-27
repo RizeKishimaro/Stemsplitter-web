@@ -1,6 +1,6 @@
 
 
-import { useEffect, useRef, type CSSProperties, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 
 import {
   setTimelineMarkerPosition,
@@ -259,6 +259,25 @@ function ClipPlayhead({ clip, transport }: { clip: AudioClip; transport: Transpo
     : null;
 }
 
+function getWaveformPathFromPeaks(
+  peaks: number[],
+  width = 180,
+  height = 44,
+): string {
+  if (!peaks.length) return "";
+  const center = height / 2;
+  const points: string[] = [];
+  peaks.forEach((peak, index) => {
+    const x = (index / peaks.length) * width;
+    const amplitude = Math.max(1, Math.min(1, peak) * center * 0.9);
+    points.push(
+      `M ${x.toFixed(2)} ${(center - amplitude).toFixed(2)}`,
+      `L ${x.toFixed(2)} ${(center + amplitude).toFixed(2)}`,
+    );
+  });
+  return points.join(" ");
+}
+
 /**
  * Individual waveform clip.
  */
@@ -267,16 +286,56 @@ function SectionClip({
   sectionStart,
   sectionEnd,
   channels,
+  sectionId,
   transport,
 }: {
   clip: AudioClip;
   sectionStart: number;
   sectionEnd: number;
   channels?: Float32Array[];
+  sectionId: string;
   transport: TransportState;
 }) {
   const channel = channels?.[0];
-  const path = channel ? getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample) : "";
+  const [serverPeaks, setServerPeaks] = useState<number[] | null>(null);
+  const clipElement = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (channel || serverPeaks) return;
+    const element = clipElement.current;
+    if (!element) return;
+    let cancelled = false;
+    let requested = false;
+    const load = () => {
+      if (requested || cancelled) return;
+      requested = true;
+      void audioEngine.getServerWaveformPeaks(sectionId, clip.stem, 90)
+        .then((peaks) => { if (!cancelled && peaks) setServerPeaks(peaks); })
+        .catch((error) => console.warn("[Waveform] Could not load server segment peaks", {
+          sectionId, stem: clip.stem, error,
+        }));
+    };
+    if (typeof IntersectionObserver === "undefined") {
+      load();
+      return () => { cancelled = true; };
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        load();
+        observer.disconnect();
+      }
+    }, { rootMargin: "160px 240px" });
+    observer.observe(element);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [channel, clip.stem, sectionId, serverPeaks]);
+
+  const path = channel
+    ? getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample)
+    : getWaveformPathFromPeaks(serverPeaks ?? []);
+  const hasWaveform = Boolean(channel || serverPeaks?.length);
 
   const sectionDuration = sectionEnd - sectionStart;
 
@@ -290,7 +349,8 @@ function SectionClip({
 
   return (
     <div
-      className={`arrangement-clip arrangement-clip--${clip.stem} ${channel ? "" : "arrangement-clip--loading"} ${clip.parentClipId
+      ref={clipElement}
+      className={`arrangement-clip arrangement-clip--${clip.stem} ${hasWaveform ? "" : "arrangement-clip--loading"} ${clip.parentClipId
           ? "arrangement-clip--split"
           : ""
         }`}
@@ -304,14 +364,14 @@ function SectionClip({
     >
       <ClipPlayhead clip={clip} transport={transport} />
 
-      {channel ? <svg
+      {hasWaveform ? <svg
         className="arrangement-clip__waveform"
         viewBox="0 0 180 44"
         preserveAspectRatio="none"
         aria-hidden="true"
       >
         <path d={path} />
-      </svg> : <span className="arrangement-clip__loading-wave" aria-label="Segment audio loading" />}
+      </svg> : <span className="arrangement-clip__loading-wave" aria-label="Loading waveform" />}
 
       <span className="arrangement-clip__label">
         {clip.splitDepth > 0
@@ -510,6 +570,7 @@ function TrackColumn({
                       sectionStart={section.startTime}
                       sectionEnd={section.endTime}
                       channels={section.stems[stem]}
+                      sectionId={section.id}
                       transport={transport}
                     />
                   </div>
