@@ -475,10 +475,21 @@ class AudioEngine {
         return;
       }
       if (!buffer || generation !== this.generation || this.sources.has(clip.id) || !getClipState().clips[clip.id]?.active) return;
-      const elapsed = Math.max(0, getAudioContext().currentTime - requestContextTime);
-      timelinePosition += elapsed;
-      startAt += elapsed;
-      if (scheduleMode === "clip-local" && clipLocalOffset !== undefined) clipLocalOffset += elapsed;
+      const context = getAudioContext();
+      if (scheduleMode === "timeline" && this.mode === "arrangement" &&
+        generation === this.generation && !this.globallyPaused) {
+        // Rebase late network/decode completion onto the ONE arrangement clock.
+        // Never add each clip's private load duration to its start time: that
+        // makes every stem drift by a different amount.
+        timelinePosition = this.getPosition();
+        startAt = context.currentTime + 0.03;
+      } else {
+        const elapsed = Math.max(0, context.currentTime - requestContextTime);
+        timelinePosition += elapsed;
+        if (scheduleMode === "clip-local" && clipLocalOffset !== undefined) {
+          clipLocalOffset += elapsed;
+        }
+      }
     }
 
     const sourceStartSample = Math.max(0, clip.sourceStartSample);
@@ -653,6 +664,7 @@ class AudioEngine {
       sourceEnd,
       loop: clip.loopEnabled,
     });
+    this.syncTransport();
 
     source.onended = () => {
       source.disconnect();
@@ -674,11 +686,13 @@ class AudioEngine {
   }
 
   private syncTransport() {
-    const playingClipIds = [...this.activeClipIds];
+    // Clip indicators represent real AudioBufferSourceNodes, not merely clips
+    // armed for arrangement playback or waiting on a remote segment download.
+    const playingClipIds = [...this.sources.keys()];
 
     updateTransport({
-      isPlaying: !this.globallyPaused && playingClipIds.length > 0,
-      isPaused: this.globallyPaused && playingClipIds.length > 0,
+      isPlaying: this.mode !== null && !this.globallyPaused,
+      isPaused: this.mode !== null && this.globallyPaused,
       playingClipIds,
       activeClipId: playingClipIds[0] ?? null,
       currentTime: this.getPosition(),
@@ -686,7 +700,7 @@ class AudioEngine {
       duration: this.duration,
     });
 
-    if (playingClipIds.length === 0) {
+    if (this.activeClipIds.size === 0) {
       this.cancelClock();
       this.mode = null;
       this.globallyPaused = false;
@@ -953,22 +967,31 @@ class AudioEngine {
       fromTime = 0;
     }
 
-    this.beginTimeline(fromTime);
-
-    for (const clip of clips) {
-      this.activeClipIds.add(clip.id);
-    }
-
-
     const playbackGeneration = this.generation;
-    // Prime only the first audible window. The clock will schedule later blocks
-    // as the playhead approaches them; never fetch/decode the entire song first.
+    // Load every stem needed at the initial playhead BEFORE starting the
+    // transport clock. This gives all four sources one shared future start.
     const initialWindowEnd = fromTime + 3;
     const initialClips = clips.filter((clip) =>
       clip.endTime > fromTime && clip.startTime <= initialWindowEnd
     );
+    await Promise.all(initialClips.map(async (clip) => {
+      try {
+        await this.getClipBufferAsync(clip);
+      } catch (error) {
+        console.error("[Audio playback] Initial arrangement segment failed to load", {
+          clipId: clip.id, stem: clip.stem, error,
+        });
+      }
+    }));
+    if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
+
+    // Start the global clock only after initial stem buffers are ready.
+    this.beginTimeline(fromTime);
+    for (const clip of clips) this.activeClipIds.add(clip.id);
+
+    const sharedStartAt = this.contextStart;
     await Promise.all(initialClips.map((clip) => this.scheduleClip(
-      clip, fromTime, this.contextStart, playbackGeneration, "timeline", undefined,
+      clip, fromTime, sharedStartAt, playbackGeneration, "timeline", undefined,
       { requestStartedAtMs, resumeDurationMs },
     )));
     if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
