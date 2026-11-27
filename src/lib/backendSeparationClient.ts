@@ -532,8 +532,8 @@ export async function startBackendSeparation(
   let completion: Promise<void> | undefined;
 
   const pendingBarGroups = new Map<number, SeparatedSection[]>();
-  const publishedGroups = new Set<number>();
   const barsPerPlaybackBlock = 4;
+  let firstBarNumber: number | null = null;
 
   const publishGroupedSegments = (groupKey: number, segments: SeparatedSection[]) => {
     const ordered = [...segments].sort((left, right) => left.startSample - right.startSample);
@@ -586,7 +586,6 @@ export async function startBackendSeparation(
     };
     addServerSegment(section, getProjectState().segmentSize);
     registerSectionClips(section);
-    publishedGroups.add(groupKey);
     pendingBarGroups.delete(groupKey);
   };
 
@@ -644,7 +643,8 @@ export async function startBackendSeparation(
       registerSectionClips(section);
       return;
     }
-    const groupKey = Math.floor(barNumber / barsPerPlaybackBlock);
+    firstBarNumber ??= barNumber;
+    const groupKey = Math.floor((barNumber - firstBarNumber) / barsPerPlaybackBlock);
     const group = pendingBarGroups.get(groupKey) ?? [];
     if (!group.some((item) => item.id === section.id)) group.push(section);
     pendingBarGroups.set(groupKey, group);
