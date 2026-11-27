@@ -672,22 +672,21 @@ class AudioEngine {
     if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
     this.pendingClipRequests.delete(clipId);
 
-    // AudioContext resume is asynchronous. Re-read the clip and buffer after
-    // it completes so scheduling uses current project state and source range.
+    // AudioContext resume is asynchronous. Re-read the clip and lazily fetch
+    // server-owned segment audio before deciding whether playback can start.
     clip = getClipState().clips[clipId];
     if (!clip?.active) return;
-    if (!this.getClipBuffer(clip)) {
-      if (import.meta.env.DEV) {
-        console.warn("[Audio timing] play request has no prepared buffer", {
-          clipId,
-          stem: clip.stem,
-          sectionId: clip.sectionId,
-          requestContextTime: requestTime,
-          contextTimeAfterResume: context.currentTime,
-        });
-      }
+    try {
+      if (!this.getClipBuffer(clip)) await this.getClipBufferAsync(clip);
+    } catch (error) {
+      if (import.meta.env.DEV) console.error("[Audio timing] segment load failed", { clipId, error });
+      if (this.pendingClipRequests.get(clipId) === requestId) this.pendingClipRequests.delete(clipId);
       return;
     }
+    if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
+    this.pendingClipRequests.delete(clipId);
+    clip = getClipState().clips[clipId];
+    if (!clip?.active || !this.getClipBuffer(clip)) return;
 
     const hadTransport = this.mode !== null;
     if (this.mode === null) {
