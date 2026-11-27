@@ -670,7 +670,6 @@ class AudioEngine {
     // A new project, stop, seek, or newer click invalidates this asynchronous
     // request. A late AudioContext.resume() must never revive a replaced track.
     if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
-    this.pendingClipRequests.delete(clipId);
 
     // AudioContext resume is asynchronous. Re-read the clip and lazily fetch
     // server-owned segment audio before deciding whether playback can start.
@@ -807,20 +806,21 @@ class AudioEngine {
     }
 
 
-    for (const clip of clips) {
-      this.scheduleClip(
-        clip,
-        fromTime,
-        this.contextStart,
-        this.generation,
-        "timeline",
-        undefined,
-        { requestStartedAtMs, resumeDurationMs },
-      );
-    }
+    const playbackGeneration = this.generation;
+    await Promise.all(clips.map((clip) => this.scheduleClip(
+      clip,
+      fromTime,
+      this.contextStart,
+      playbackGeneration,
+      "timeline",
+      undefined,
+      { requestStartedAtMs, resumeDurationMs },
+    )));
 
+    // Remote segment loads are asynchronous. Do not stop the transport just
+    // because no AudioBufferSourceNode exists yet; wait for all clip schedules.
+    if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
     this.syncTransport();
-
     if (this.sources.size > 0) {
       this.startClock();
     } else {
