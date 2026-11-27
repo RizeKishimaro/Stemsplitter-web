@@ -856,8 +856,10 @@ class AudioEngine {
       ? position
       : this.timelineStart + Math.max(0, scheduleAt - this.contextStart);
     const pausedOffset = this.pausedLocalOffsets.get(clipId);
+    // Manual playback must replay a clip when the shared playhead has
+    // already passed its end. Timeline mapping would point beyond sourceEnd.
     const scheduleMode = pausedOffset !== undefined ||
-      (hadTransport && targetPosition < clip.startTime)
+      (hadTransport && (targetPosition < clip.startTime || targetPosition >= clip.endTime))
       ? "clip-local"
       : "timeline";
     if (scheduleMode === "clip-local") this.localPlaybackClipIds.add(clipId);
