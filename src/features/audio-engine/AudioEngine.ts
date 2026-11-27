@@ -42,6 +42,8 @@ class AudioEngine {
   private remoteBufferLoads = new Map<string, Promise<AudioBuffer | null>>();
   private remoteBufferKeys = new Set<string>();
   private readonly maxRemoteBuffers = 24;
+  private activeRemoteLoads = 0;
+  private remoteLoadWaiters: Array<() => void> = [];
   private activeClipIds = new Set<string>();
   private localPlaybackClipIds = new Set<string>();
   private pausedLocalOffsets = new Map<string, number>();
@@ -254,6 +256,22 @@ class AudioEngine {
     return peaks;
   }
 
+  private async acquireRemoteLoadSlot(): Promise<() => void> {
+    if (this.activeRemoteLoads < 4) {
+      this.activeRemoteLoads++;
+    } else {
+      await new Promise<void>((resolve) => this.remoteLoadWaiters.push(resolve));
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.remoteLoadWaiters.shift();
+      if (next) next();
+      else this.activeRemoteLoads = Math.max(0, this.activeRemoteLoads - 1);
+    };
+  }
+
   private async getClipBufferAsync(clip: AudioClip): Promise<AudioBuffer | null> {
     const key = `${clip.sectionId}:${clip.stem}`;
     const cached = this.preparedBuffers.get(key);
@@ -270,10 +288,12 @@ class AudioEngine {
     if (pending) return pending;
 
     const load = (async () => {
-      const context = getAudioContext();
-      const parts: AudioBuffer[] = [];
-      let previousEndSample: number | null = null;
-      for (const part of source.parts) {
+      const releaseSlot = await this.acquireRemoteLoadSlot();
+      try {
+        const context = getAudioContext();
+        const parts: AudioBuffer[] = [];
+        let previousEndSample: number | null = null;
+        for (const part of source.parts) {
         if (previousEndSample !== null && part.startSample !== previousEndSample) {
           throw new Error(`Server stem block ${clip.sectionId} has a gap or overlap between source segments.`);
         }
@@ -308,7 +328,10 @@ class AudioEngine {
         this.remoteBufferKeys.delete(oldest);
         this.preparedBuffers.delete(oldest);
       }
-      return combined;
+        return combined;
+      } finally {
+        releaseSlot();
+      }
     })();
     this.remoteBufferLoads.set(key, load);
     try {
