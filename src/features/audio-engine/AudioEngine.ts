@@ -291,7 +291,7 @@ class AudioEngine {
     this.stopSource(clipId);
     if (wasLocalPlayback) this.localPlaybackClipIds.add(clipId);
     else this.localPlaybackClipIds.delete(clipId);
-    this.scheduleClip(
+    void this.scheduleClip(
       clip,
       wasLocalPlayback
         ? this.getPosition()
@@ -302,13 +302,14 @@ class AudioEngine {
       wasLocalPlayback
         ? sourceOffset + (scheduledTime - context.currentTime)
         : undefined,
-    );
-    if (!this.sources.has(clipId)) {
-      this.activeClipIds.delete(clipId);
-      this.localPlaybackClipIds.delete(clipId);
-      this.pausedLocalOffsets.delete(clipId);
-      this.syncTransport();
-    }
+    ).then(() => {
+      if (!this.sources.has(clipId) && generation === this.generation) {
+        this.activeClipIds.delete(clipId);
+        this.localPlaybackClipIds.delete(clipId);
+        this.pausedLocalOffsets.delete(clipId);
+        this.syncTransport();
+      }
+    });
   }
 
   private async scheduleClip(
