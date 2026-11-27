@@ -645,10 +645,14 @@ export async function startBackendSeparation(
     }
     firstBarNumber ??= barNumber;
     const groupKey = Math.floor((barNumber - firstBarNumber) / barsPerPlaybackBlock);
+    // Segment events can split a bar into multiple pieces. Finalize a block
+    // only after the stream advances into the next four-bar window.
+    for (const [pendingKey, pendingSegments] of pendingBarGroups) {
+      if (pendingKey < groupKey) publishGroupedSegments(pendingKey, pendingSegments);
+    }
     const group = pendingBarGroups.get(groupKey) ?? [];
     if (!group.some((item) => item.id === section.id)) group.push(section);
     pendingBarGroups.set(groupKey, group);
-    if (group.length >= barsPerPlaybackBlock) publishGroupedSegments(groupKey, group);
   };
 
   const complete = () => {
