@@ -485,6 +485,7 @@ function TrackColumn({
   selectedClipId,
   transport,
   rowCount,
+  sectionRowById,
   beats,
   downbeats,
   sampleRate,
@@ -499,6 +500,7 @@ function TrackColumn({
   selectedClipId: string | null;
   transport: TransportState;
   rowCount: number;
+  sectionRowById: Map<string, number>;
   beats: Array<{ original: number; sample: number }>;
   downbeats: Array<{ original: number; sample: number; bar: number }>;
   sampleRate: number;
@@ -516,7 +518,8 @@ function TrackColumn({
 
     if (!section) continue;
 
-    const row = section.index + 1;
+    const row = sectionRowById.get(clip.sectionId);
+    if (row === undefined) continue;
     const rowClips = clipsByRow.get(row) ?? [];
 
     rowClips.push(clip);
@@ -636,11 +639,6 @@ export function ArrangementGrid({
     clipState.clips,
   ).filter(clip => clip.active);
 
-  const rowCount = Math.max(
-    9,
-    project.sections.length,
-    Object.keys(project.completedSections).length,
-  );
   const timeline = project.masterTimeline;
   const markerGrid = project.beatMarkerGrid ?? (timeline ? {
     sampleRate: timeline.sampleRate,
@@ -665,6 +663,18 @@ export function ArrangementGrid({
     sampleRate: markerGrid?.sampleRate ?? timeline?.sampleRate ?? 0,
     stems: { drums: [], bass: [], other: [], vocals: [] },
   }])) as typeof project.completedSections;
+
+  // Timeline section indexes are musical bar positions (for example 1, 5, 9),
+  // not visual row numbers. Build compact rows from the actual active sections.
+  const orderedSectionIds = [...new Set(activeClips.map((clip) => clip.sectionId))]
+    .filter((sectionId) => Boolean(renderedSections[sectionId]))
+    .sort((a, b) =>
+      renderedSections[a].startTime - renderedSections[b].startTime
+    );
+  const sectionRowById = new Map(
+    orderedSectionIds.map((sectionId, index) => [sectionId, index + 1]),
+  );
+  const rowCount = Math.max(1, orderedSectionIds.length);
 
   return (
     <section
@@ -700,6 +710,7 @@ export function ArrangementGrid({
             selectedClipId={clipState.selectedClipId}
             transport={transport}
             rowCount={rowCount}
+            sectionRowById={sectionRowById}
             beats={beats}
             downbeats={downbeats}
             sampleRate={markerGrid?.sampleRate ?? 0}
