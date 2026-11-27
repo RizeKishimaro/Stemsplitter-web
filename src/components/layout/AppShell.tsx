@@ -286,7 +286,7 @@ export function AppShell() {
     };
   }, []);
 
-  function handleAudioLoaded(file: File) {
+  async function handleAudioLoaded(file: File) {
     const importId = ++activeImport.current;
     cancelCurrentJob.current?.();
     cancelCurrentJob.current = null;
@@ -299,7 +299,10 @@ export function AppShell() {
     setProcessingProgress(null);
     const controller = new AbortController();
     cancelCurrentJob.current = () => controller.abort();
-    void startBackendSeparationFromFile(file, "drums_first", {
+    void (async () => {
+      const audio = await getAudioContext().decodeAudioData(await file.arrayBuffer());
+      if (activeImport.current !== importId || controller.signal.aborted) return;
+      return startBackendSeparationFromFile(file, audio, "drums_first", {
       onProgress: (event) => {
         if (activeImport.current !== importId) return;
         if (event.event === "stem.completed") {
@@ -333,7 +336,9 @@ export function AppShell() {
         setProcessingProgress(100);
         cancelCurrentJob.current = null;
       },
-    }, 4, controller.signal).then((handle) => {
+      }, 4, controller.signal);
+    })().then((handle) => {
+      if (!handle) return;
       if (activeImport.current !== importId || controller.signal.aborted) {
         handle.close();
         return;
