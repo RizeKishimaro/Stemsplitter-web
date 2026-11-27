@@ -6,18 +6,18 @@ import { assembleMasterTimelineSections } from "../features/stem-separation/sepa
 import { getClipState, registerSectionClips, resetClips, setClipLoop } from "../stores/clip.store";
 import { restoreClipSnapshot, type AudioClip } from "../stores/clip.store";
 import {
+  addSeparatedSection,
   finishSeparation,
   getProjectState,
   setArrangementSections,
   setBackendBeatTimeline,
-  addServerSegment,
   setProjectError,
   setProjectStatus,
   setSegmentSizePreference,
-  setBackendProjectId,
   restoreProjectSnapshot,
   type ProjectState,
 } from "../stores/project.store";
+import { replaceLocalSections, saveBackendJobId, saveLocalSection } from "./localProjectStore";
 
 export type AnalysisStrategy = "mix_first" | "drums_first";
 const BACKEND_API_BASE = API_BASE_URL;
@@ -121,6 +121,17 @@ export async function restoreLastServerProject(signal?: AbortSignal): Promise<bo
   return true;
 }
 
+type BackendStemMetadata = {
+  name?: string;
+  url?: string;
+  sample_rate?: number;
+  channels?: number;
+  frame_count?: number;
+  duration_seconds?: number;
+  audio_format?: string;
+  file_size_bytes?: number;
+};
+
 type BackendEvent = {
   event?: string;
   stage?: string;
@@ -129,103 +140,13 @@ type BackendEvent = {
   message?: string;
   job_id?: string;
   chunk?: { segmentId?: string };
+  stem?: string;
+  stem_metadata?: BackendStemMetadata;
 };
-
-type SegmentManifestItem = {
-  segmentId: string;
-  segmentIndex: number;
-  barNumber: number | null;
-  startSample: number;
-  endSample: number;
-  sampleRate: number;
-  channels: number;
-  frameCount: number;
-  status: string;
-  stems: Record<StemName, { url: string; sampleRate: number; channels: number; frameCount: number }>;
-};
-
-type ProgressiveJobState = { grid: BeatGrid; loaded: Set<string>; loading: Map<string, Promise<void>>; segmentSize: ArrangementSegmentSize };
-const progressiveJobs = new Map<string, Promise<ProgressiveJobState>>();
-
-async function ensureProgressiveJob(job: BackendJob, signal?: AbortSignal): Promise<ProgressiveJobState> {
-  const existing = progressiveJobs.get(job.id);
-  if (existing) return existing;
-  const initialization = (async () => {
-    const projectId = job.result_metadata?.projectId;
-    if (!projectId || projectId !== job.project_id || !job.result_metadata.analysisUrl) {
-      throw new Error("Job metadata is missing its project or analysis reference.");
-    }
-    const [projectResponse, analysisResponse] = await Promise.all([
-      fetch(apiUrl(`projects/${encodeURIComponent(projectId)}`), { signal }),
-      fetch(apiUrl(job.result_metadata.analysisUrl), { signal }),
-    ]);
-    const project = await responseJson<BackendProject>(projectResponse, "Could not load project metadata");
-    const grid = await responseJson<BeatGrid>(analysisResponse, "Could not load the saved beat grid");
-    if (project.project.id !== projectId || grid.projectId !== projectId || grid.jobId !== job.id || grid.audio.samplePositionUnit !== "frames") {
-      throw new Error("Project, job, and analysis metadata do not describe the same source timeline.");
-    }
-    const segmentSize = getProjectState().segmentSize;
-    audioEngine.stop();
-    audioEngine.clearPreparedBuffers();
-    resetClips();
-    setBackendBeatTimeline(grid, [], segmentSize);
-    return { grid, loaded: new Set<string>(), loading: new Map<string, Promise<void>>(), segmentSize };
-  })();
-  progressiveJobs.set(job.id, initialization);
-  try {
-    return await initialization;
-  } catch (error) {
-    progressiveJobs.delete(job.id);
-    throw error;
-  }
-}
-
-async function loadOneSegment(item: SegmentManifestItem, job: BackendJob, signal?: AbortSignal) {
-  const session = await ensureProgressiveJob(job, signal);
-  if (session.loaded.has(item.segmentId)) return;
-  const inProgress = session.loading.get(item.segmentId);
-  if (inProgress) return inProgress;
-  const load = (async () => {
-  if (item.status !== "READY" || item.sampleRate !== session.grid.audio.sampleRate ||
-    item.channels !== session.grid.audio.channels || item.frameCount !== item.endSample - item.startSample) {
-    throw new Error(`Segment ${item.segmentId} does not match the shared source timeline.`);
-  }
-  const channels: Record<StemName, Float32Array[]> = {} as Record<StemName, Float32Array[]>;
-  for (const stem of STEM_NAMES) {
-    const asset = item.stems[stem];
-    if (!asset || asset.sampleRate !== item.sampleRate || asset.channels !== item.channels || asset.frameCount !== item.frameCount) {
-      throw new Error(`${stem} segment metadata is inconsistent for ${item.segmentId}.`);
-    }
-    const response = await fetch(apiUrl(asset.url), { signal });
-    if (!response.ok) throw new Error(`Could not fetch ${stem} segment ${item.segmentId} (${response.status}).`);
-    channels[stem] = decodeStemWav(await response.arrayBuffer(), {
-      name: stem, sampleRate: item.sampleRate, channels: item.channels, frames: item.frameCount,
-    });
-  }
-  const startBar = Math.max(0, (item.barNumber ?? 1) - 1);
-  const section: SeparatedSection = {
-    id: item.segmentId,
-    index: item.segmentIndex,
-    startBar,
-    endBar: startBar + 1,
-    startSample: item.startSample,
-    endSample: item.endSample,
-    startTime: item.startSample / item.sampleRate,
-    endTime: item.endSample / item.sampleRate,
-    sampleRate: item.sampleRate,
-    stems: channels,
-  };
-  audioEngine.prepareSection(section);
-  addServerSegment(section, session.segmentSize);
-  registerSectionClips(section);
-  session.loaded.add(item.segmentId);
-  })();
-  session.loading.set(item.segmentId, load);
-  try { await load; } finally { session.loading.delete(item.segmentId); }
-}
 
 export type BackendSeparationCallbacks = {
   onProgress?: (event: BackendEvent) => void;
+  onStemCompleted?: (stem: StemName) => void;
   onComplete?: () => void;
   onError?: (error: Error) => void;
 };
@@ -487,8 +408,7 @@ export async function changeArrangementSegmentSize(segmentSize: ArrangementSegme
       project.masterTimeline.meter,
       segmentSize,
     );
-    // Local PCM may be present only for sections already loaded into memory.
-    // Do not write the derived audio back to IndexedDB.
+    await replaceLocalSections(regrouped);
     audioEngine.stop();
     audioEngine.clearPreparedBuffers();
     resetClips();
@@ -562,18 +482,19 @@ export async function fetchSuccessfulJobAudio(
 }
 
 async function loadSuccessfulJob(job: BackendJob, signal?: AbortSignal): Promise<SeparatedSection[]> {
-  if (job.status !== "SUCCEEDED") throw new Error(`Separation job is ${job.status.toLowerCase()}.`);
-  const session = await ensureProgressiveJob(job, signal);
-  const projectId = job.result_metadata.projectId!;
-  const manifestResponse = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}/segments`), { signal });
-  const manifest = await responseJson<SegmentManifestItem[]>(manifestResponse, "Could not load segment manifest");
-  const ready = manifest.filter((item) => item.status === "READY" && !session.loaded.has(item.segmentId)).sort((a, b) => a.segmentIndex - b.segmentIndex);
-  for (const item of ready) await loadOneSegment(item, job, signal);
-  if (manifest.length === 0) {
-    throw new Error("The job succeeded but its synchronized audio segments are missing.");
+  const segmentSize = getProjectState().segmentSize;
+  const { grid, sections } = await fetchSuccessfulJobAudio(job, fetch, signal, segmentSize);
+  audioEngine.stop();
+  audioEngine.clearPreparedBuffers();
+  resetClips();
+  setBackendBeatTimeline(grid, sections, segmentSize);
+  for (const section of sections) {
+    audioEngine.prepareSection(section);
+    registerSectionClips(section);
   }
+  await Promise.all(sections.map(saveLocalSection));
   finishSeparation();
-  return Object.values(getProjectState().completedSections).sort((a, b) => a.startSample - b.startSample);
+  return sections;
 }
 
 async function getJob(jobId: string, signal?: AbortSignal): Promise<BackendJob> {
@@ -588,6 +509,7 @@ function websocketUrl(path: string) {
 
 export async function startBackendSeparationFromFile(
   file: File,
+  audio: AudioBuffer,
   strategy: AnalysisStrategy,
   callbacks: BackendSeparationCallbacks,
   beatsPerBar = 4,
@@ -599,14 +521,11 @@ export async function startBackendSeparationFromFile(
     signal,
   });
   const project = await responseJson<{ id: string }>(projectResponse, "Could not create backend project");
-  setBackendProjectId(project.id);
   const form = new FormData();
   form.set("file", file, file.name);
-  // The encoded source is authoritative; these valid placeholders are only
-  // retained for compatibility with the current upload contract.
-  form.set("sample_rate", "48000");
-  form.set("channels", "2");
-  form.set("frame_count", "1");
+  form.set("sample_rate", String(audio.sampleRate));
+  form.set("channels", String(audio.numberOfChannels));
+  form.set("frame_count", String(audio.length));
   const uploadResponse = await fetch(apiUrl(`projects/${encodeURIComponent(project.id)}/audio`), { method: "POST", body: form, signal });
   const asset = await responseJson<{ id: string }>(uploadResponse, "Could not upload audio for HTDemucs");
   return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar, signal);
@@ -629,6 +548,7 @@ export async function startBackendSeparation(
     signal,
   });
   const job = await responseJson<BackendJob>(response, "Could not create separation job");
+  await saveBackendJobId(job.id);
   setProjectStatus("separating");
 
   const socket = new WebSocket(websocketUrl(`jobs/${encodeURIComponent(job.id)}/events`));
@@ -639,9 +559,105 @@ export async function startBackendSeparation(
   let manualClose = false;
   let completed = false;
   let completion: Promise<void> | undefined;
+
+  // A stem.completed event is emitted only after the backend has validated
+  // and atomically published the partial WAV. Download it immediately so the
+  // arrangement can expose that track while the other stems are still running.
+  const partialStemBuffers: Partial<Record<StemName, Float32Array[]>> = {};
+  const partialLoads = new Map<StemName, Promise<void>>();
+  let partialSource: { sampleRate: number; channels: number; frames: number } | null = null;
+
+  const receivePartialStem = async (event: BackendEvent, stem: StemName) => {
+    const metadata = event.stem_metadata;
+    const sampleRate = metadata?.sample_rate;
+    const channels = metadata?.channels;
+    const frames = metadata?.frame_count;
+    const url = metadata?.url;
+
+    if (!url || metadata?.audio_format !== "wav" ||
+      typeof sampleRate !== "number" || !Number.isSafeInteger(sampleRate) || sampleRate <= 0 ||
+      typeof channels !== "number" || !Number.isSafeInteger(channels) || channels < 1 || channels > 2 ||
+      typeof frames !== "number" || !Number.isSafeInteger(frames) || frames <= 0) {
+      throw new Error(`The backend returned invalid metadata for the ${stem} stem.`);
+    }
+
+    if (partialSource &&
+      (partialSource.sampleRate !== sampleRate ||
+        partialSource.channels !== channels ||
+        partialSource.frames !== frames)) {
+      throw new Error(`${stem} stem does not match the source timeline of the other completed stems.`);
+    }
+    partialSource ??= { sampleRate, channels, frames };
+
+    const response = await fetch(apiUrl(url), { signal });
+    if (!response.ok) {
+      throw new Error(`Could not download the completed ${stem} stem (${response.status}).`);
+    }
+    const decoded = decodeStemWav(await response.arrayBuffer(), {
+      name: stem,
+      sampleRate,
+      channels,
+      frames,
+    });
+    if (signal?.aborted) return;
+
+    partialStemBuffers[stem] = decoded;
+    const sectionId = `${job.id.replaceAll("-", "")}-partial-full-track`;
+    const section: SeparatedSection = {
+      id: sectionId,
+      index: 0,
+      startBar: 0,
+      endBar: 0,
+      startTime: 0,
+      endTime: frames / sampleRate,
+      startSample: 0,
+      endSample: frames,
+      sampleRate,
+      // Missing stems remain empty. AudioEngine and registerSectionClips
+      // only prepare tracks whose PCM has arrived.
+      stems: {
+        drums: partialStemBuffers.drums ?? [],
+        bass: partialStemBuffers.bass ?? [],
+        other: partialStemBuffers.other ?? [],
+        vocals: partialStemBuffers.vocals ?? [],
+      },
+    };
+
+    addSeparatedSection(section);
+    audioEngine.prepareSection(section);
+    registerSectionClips(section);
+    callbacks.onStemCompleted?.(stem);
+  };
+
+  const schedulePartialStem = (event: BackendEvent) => {
+    if (!event.stem || !STEM_NAMES.includes(event.stem as StemName)) return;
+    const stem = event.stem as StemName;
+    if (partialStemBuffers[stem] || partialLoads.has(stem)) return;
+
+    const task = receivePartialStem(event, stem);
+    partialLoads.set(stem, task);
+    void task.catch((error: unknown) => {
+      if (signal?.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[Backend separation] Incremental ${stem} stem download failed:`, message);
+      callbacks.onProgress?.({
+        event: "stem.download_failed",
+        stem,
+        message: `${stem} is ready on the server but could not be downloaded yet; it will be loaded after processing finishes.`,
+      });
+    }).finally(() => {
+      if (partialLoads.get(stem) === task) partialLoads.delete(stem);
+    });
+  };
+
+  const waitForPartialLoads = async () => {
+    await Promise.allSettled([...partialLoads.values()]);
+  };
+
   const complete = () => {
     if (completion) return completion;
     completion = (async () => {
+      await waitForPartialLoads();
       let latest = await getJob(job.id, signal);
       while (latest.status === "QUEUED" || latest.status === "RUNNING") {
         await abortableDelay(1_000, signal);
@@ -670,19 +686,8 @@ export async function startBackendSeparation(
     if (signal?.aborted) return;
     try {
       const event = JSON.parse(String(message.data)) as BackendEvent;
+      if (event.event === "stem.completed") schedulePartialStem(event);
       callbacks.onProgress?.(event);
-      if (event.event === "segment.ready") {
-        void getJob(job.id, signal).then(async (latest) => {
-          const session = await ensureProgressiveJob(latest, signal);
-          const projectId = latest.result_metadata.projectId;
-          if (!projectId) throw new Error("Segment event job has no project ID.");
-          const response = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}/segments`), { signal });
-          const manifest = await responseJson<SegmentManifestItem[]>(response, "Could not retrieve ready segment manifest");
-          for (const item of manifest.filter((entry) => entry.status === "READY" && !session.loaded.has(entry.segmentId))) {
-            await loadOneSegment(item, latest, signal);
-          }
-        }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
-      }
       if (event.status === "SUCCEEDED") void complete().catch(() => undefined);
       if (event.status === "FAILED" || event.status === "CANCELLED") {
         manualClose = true;
@@ -698,10 +703,12 @@ export async function startBackendSeparation(
   };
   socket.onclose = () => {
     if (manualClose || completed || completion || signal?.aborted) return;
-    void recoverBackendJob(job.id, signal).then(() => {
+    void (async () => {
+      await waitForPartialLoads();
+      await recoverBackendJob(job.id, signal);
       completed = true;
       callbacks.onComplete?.();
-    }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
+    })().catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
   };
   const close = () => { manualClose = true; socket.close(); };
   signal?.addEventListener("abort", close, { once: true });

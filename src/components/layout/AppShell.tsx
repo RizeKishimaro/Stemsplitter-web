@@ -302,12 +302,24 @@ export function AppShell() {
     void startBackendSeparationFromFile(file, "drums_first", {
       onProgress: (event) => {
         if (activeImport.current !== importId) return;
+        if (event.event === "stem.completed") {
+          setProcessingMessage(`Downloading ${event.stem?.toUpperCase() ?? "completed"} stem…`);
+          return;
+        }
+        if (event.event === "stem.download_failed") {
+          setProcessingMessage(event.message ?? "A completed stem will be loaded after processing finishes.");
+          return;
+        }
         const stage = event.stage ?? event.event ?? event.status ?? "Processing";
         const progress = typeof event.progress === "number" && Number.isFinite(event.progress)
           ? Math.max(0, Math.min(100, event.progress))
           : null;
         setProcessingProgress(progress);
         setProcessingMessage(`${stage}${event.message ? ` · ${event.message}` : ""}`);
+      },
+      onStemCompleted: (stem) => {
+        if (activeImport.current !== importId) return;
+        setProcessingMessage(`${stem.toUpperCase()} stem added to the arrangement.`);
       },
       onError: (error) => {
         if (activeImport.current !== importId || controller.signal.aborted) return;
