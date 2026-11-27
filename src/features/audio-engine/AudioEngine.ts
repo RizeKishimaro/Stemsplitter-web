@@ -270,15 +270,37 @@ class AudioEngine {
     if (pending) return pending;
 
     const load = (async () => {
-      const response = await fetch(source.url);
-      if (!response.ok) throw new Error(`Could not fetch ${clip.stem} segment ${clip.sectionId} (${response.status}).`);
-      const bytes = await response.arrayBuffer();
-      const buffer = await getAudioContext().decodeAudioData(bytes.slice(0));
-      if (buffer.sampleRate !== source.sampleRate || buffer.numberOfChannels !== source.channels ||
-        buffer.length !== source.frames) {
-        throw new Error(`Decoded ${clip.stem} segment metadata does not match its manifest.`);
+      const context = getAudioContext();
+      const parts: AudioBuffer[] = [];
+      let previousEndSample: number | null = null;
+      for (const part of source.parts) {
+        if (previousEndSample !== null && part.startSample !== previousEndSample) {
+          throw new Error(`Server stem block ${clip.sectionId} has a gap or overlap between source segments.`);
+        }
+        const response = await fetch(part.url);
+        if (!response.ok) throw new Error(`Could not fetch ${clip.stem} segment ${clip.sectionId} (${response.status}).`);
+        const bytes = await response.arrayBuffer();
+        const decoded = await context.decodeAudioData(bytes.slice(0));
+        const expectedDuration = part.frames / part.sampleRate;
+        if (decoded.numberOfChannels !== part.channels ||
+          Math.abs(decoded.duration - expectedDuration) > 1 / part.sampleRate) {
+          throw new Error(`Decoded ${clip.stem} segment duration/channels do not match its manifest.`);
+        }
+        parts.push(decoded);
+        previousEndSample = part.endSample;
       }
-      this.preparedBuffers.set(key, buffer);
+      if (!parts.length) return null;
+      const totalFrames = parts.reduce((sum, part) => sum + part.length, 0);
+      const channels = Math.min(2, source.channels);
+      const combined = context.createBuffer(channels, totalFrames, context.sampleRate);
+      let writeOffset = 0;
+      for (const part of parts) {
+        for (let channel = 0; channel < channels; channel++) {
+          combined.getChannelData(channel).set(part.getChannelData(channel), writeOffset);
+        }
+        writeOffset += part.length;
+      }
+      this.preparedBuffers.set(key, combined);
       this.remoteBufferKeys.add(key);
       while (this.remoteBufferKeys.size > this.maxRemoteBuffers) {
         const oldest = this.remoteBufferKeys.values().next().value as string | undefined;
@@ -286,7 +308,7 @@ class AudioEngine {
         this.remoteBufferKeys.delete(oldest);
         this.preparedBuffers.delete(oldest);
       }
-      return buffer;
+      return combined;
     })();
     this.remoteBufferLoads.set(key, load);
     try {
