@@ -27,7 +27,14 @@ const initialState: TransportState = {
 let state = initialState;
 const listeners = new Set<() => void>();
 const frameListeners = new Set<() => void>();
+const frameRenderers = new Set<(position: number) => void>();
 let framePosition = 0;
+
+function publishFrame(position: number) {
+  framePosition = position;
+  frameListeners.forEach(listener => listener());
+  frameRenderers.forEach(render => render(position));
+}
 
 function emit() {
   listeners.forEach(listener => listener());
@@ -59,8 +66,7 @@ export function updateTransport(
 ) {
   state = { ...state, ...partial };
   if (partial.currentTime !== undefined) {
-    framePosition = partial.currentTime;
-    frameListeners.forEach(listener => listener());
+    publishFrame(partial.currentTime);
   }
   emit();
 }
@@ -68,13 +74,19 @@ export function updateTransport(
 /** High-frequency visual clock. Audio playback itself remains driven by AudioContext. */
 export function publishTransportFrame(position: number) {
   if (!Number.isFinite(position) || position === framePosition) return;
-  framePosition = position;
-  frameListeners.forEach(listener => listener());
+  publishFrame(position);
 }
 
 export function subscribeTransportFrames(listener: () => void) {
   frameListeners.add(listener);
   return () => frameListeners.delete(listener);
+}
+
+/** Direct DOM render callbacks for high-frequency visuals that should not rerender React. */
+export function registerTransportFrameRenderer(render: (position: number) => void) {
+  frameRenderers.add(render);
+  render(framePosition);
+  return () => frameRenderers.delete(render);
 }
 
 export function getTransportFramePosition() { return framePosition; }
@@ -89,7 +101,6 @@ export function useTransportPosition() {
 
 export function resetTransport() {
   state = { ...initialState };
-  framePosition = 0;
-  frameListeners.forEach(listener => listener());
+  publishFrame(0);
   emit();
 }

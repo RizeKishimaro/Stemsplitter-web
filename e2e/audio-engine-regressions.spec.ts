@@ -11,6 +11,11 @@ type EngineSnapshot = {
   audioDiagnostics: {
     globalTimelinePosition: number;
     activeSourceCount: number;
+    playbackStart: {
+      requestToSourceStartMs: number;
+      audioContextResumeMs: number;
+      estimatedClickToAudibleMs: number;
+    } | null;
     activeSources: Array<{ clipId: string; stem: string }>;
     activeSchedules: Array<{
       clipId: string;
@@ -69,11 +74,15 @@ test.describe("Firefox Web Audio lifecycle", () => {
         .toBe(1);
       const current = await snapshot(page);
       const schedule = current.audioDiagnostics!.activeSchedules[0];
+      const startup = current.audioDiagnostics!.playbackStart!;
       expect(schedule.sourceOffsetSeconds).toBe(0);
       expect(schedule.sourceOffsetSamples).toBe(0);
       expect(schedule.scheduledContextTime - audioClockBeforeClick).toBeGreaterThan(0);
       expect(schedule.scheduledContextTime - audioClockBeforeClick).toBeLessThan(0.2);
       expect(schedule.scheduledContextTime).not.toBe(timelineStart);
+      expect(startup.audioContextResumeMs).toBeLessThan(300);
+      expect(startup.requestToSourceStartMs).toBeLessThan(300);
+      expect(startup.estimatedClickToAudibleMs).toBeLessThan(500);
       expect(current.transport.currentTime).toBeGreaterThanOrEqual(timelineStart);
 
       await page.evaluate(() => window.__SONICLAB_E2E__!.stop());

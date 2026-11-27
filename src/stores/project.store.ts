@@ -52,6 +52,8 @@ export type BeatMarkerGrid = {
 export type ProjectState = {
   file: File | null;
   audio: AudioBuffer | null;
+  backendProjectId: string | null;
+  serverSaveStatus: "idle" | "saving" | "saved" | "error";
 
   analysis: AnalysisResult | null;
   masterTimeline: MasterTimeline | null;
@@ -74,6 +76,8 @@ export type ProjectState = {
 const initialState: ProjectState = {
   file: null,
   audio: null,
+  backendProjectId: null,
+  serverSaveStatus: "idle",
   analysis: null,
   masterTimeline: null,
   beatMarkerGrid: null,
@@ -148,7 +152,7 @@ export function useProjectStoreSelector<T>(selector: (value: ProjectState) => T)
 }
 
 // Import original audio.
-export function setImportedAudio(file: File, audio: AudioBuffer) {
+export function setImportedAudio(file: File, audio: AudioBuffer | null = null) {
   state = {
     ...initialState,
     file,
@@ -159,9 +163,23 @@ export function setImportedAudio(file: File, audio: AudioBuffer) {
   emit();
 }
 
+export function setBackendProjectId(backendProjectId: string | null) {
+  if (typeof localStorage !== "undefined") {
+    try {
+      if (backendProjectId) localStorage.setItem("dubpad:last-server-project", backendProjectId);
+      else localStorage.removeItem("dubpad:last-server-project");
+    } catch { /* Server remains authoritative when browser storage is unavailable. */ }
+  }
+  updateState({ backendProjectId, serverSaveStatus: "idle" });
+}
+
+export function setServerSaveStatus(serverSaveStatus: ProjectState["serverSaveStatus"]) {
+  updateState({ serverSaveStatus });
+}
+
 export function restoreProjectSnapshot(
   file: File,
-  audio: AudioBuffer,
+  audio: AudioBuffer | null,
   saved: Omit<ProjectState, "file" | "audio" | "completedSections" | "sectionProgress" | "sectionErrors" | "error">,
   completedSections: SeparatedSection[],
 ) {
@@ -352,6 +370,35 @@ export function setArrangementSections(sections: SeparatedSection[], segmentSize
     sectionErrors: {},
     status: "complete",
     error: null,
+  });
+}
+
+/** Publish segment geometry as soon as the backend marks a segment READY. */
+export function addServerSegment(section: SeparatedSection, segmentSize: ArrangementSegmentSize) {
+  const metadata: SeparationSection = {
+    id: section.id,
+    index: section.index,
+    startBar: section.startBar,
+    endBar: section.endBar,
+    startTime: section.startTime,
+    endTime: section.endTime,
+    startSample: section.startSample,
+    endSample: section.endSample,
+    processStartSample: section.startSample,
+    processEndSample: section.endSample,
+    trimStartSample: 0,
+    trimEndSample: 0,
+    duration: section.endTime - section.startTime,
+    chunkIds: [section.id],
+    kind: section.kind ?? "bars",
+  };
+  const sections = [...state.sections.filter((item) => item.id !== section.id), metadata].sort((a, b) => a.startSample - b.startSample);
+  updateState({
+    sections,
+    completedSections: { ...state.completedSections, [section.id]: section },
+    sectionProgress: { ...state.sectionProgress, [section.id]: 100 },
+    segmentSize,
+    status: "separating",
   });
 }
 

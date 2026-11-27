@@ -7,6 +7,7 @@ import {
 import {
   getTransportSnapshot,
   publishTransportFrame,
+  registerTransportFrameRenderer,
   resetTransport,
   subscribeTransport,
   subscribeTransportFrames,
@@ -70,6 +71,22 @@ test("visual frame ticks do not broadcast full transport state", () => {
   expect(getTransportSnapshot().currentTime).toBe(3.032);
   stopTransport();
   stopFrames();
+  resetTransport();
+});
+
+test("transport frame renderers receive audio-clock positions without React store updates", () => {
+  resetTransport();
+  const positions: number[] = [];
+  let transportNotifications = 0;
+  const stopTransport = subscribeTransport(() => transportNotifications++);
+  const unregisterRenderer = registerTransportFrameRenderer((position) => positions.push(position));
+  const stateNotificationsBeforeFrames = transportNotifications;
+  publishTransportFrame(2.5);
+  publishTransportFrame(2.516);
+  expect(positions).toEqual([0, 2.5, 2.516]);
+  expect(transportNotifications).toBe(stateNotificationsBeforeFrames);
+  unregisterRenderer();
+  stopTransport();
   resetTransport();
 });
 

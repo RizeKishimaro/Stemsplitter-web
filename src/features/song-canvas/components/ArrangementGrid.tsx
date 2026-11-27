@@ -1,6 +1,6 @@
 
 
-import { useCallback, useSyncExternalStore, type CSSProperties, type MouseEvent } from "react";
+import { useEffect, useRef, type CSSProperties, type MouseEvent } from "react";
 
 import {
   setTimelineMarkerPosition,
@@ -23,8 +23,7 @@ import {
 
 import {
   useTransportStore,
-  getTransportFramePosition,
-  subscribeTransportFrames,
+  registerTransportFrameRenderer,
   type TransportState,
 } from "../../../stores/transport.store";
 
@@ -226,23 +225,38 @@ function ClipControls({
  *
  * The position always comes from the shared global transport clock.
  */
-function useClipPlayheadProgress(clip: AudioClip, transport: TransportState) {
-  const isInPlaybackSession =
-    transport.playingClipIds.includes(clip.id);
-  const clipDuration = clip.endTime - clip.startTime;
-  const getSnapshot = useCallback(() => {
-    if (!isInPlaybackSession || (!transport.isPlaying && !transport.isPaused) || clipDuration <= 0) return null;
-    const elapsed = getTransportFramePosition() - clip.startTime;
-    if (elapsed < 0 || (!clip.loopEnabled && elapsed > clipDuration)) return null;
-    return clip.loopEnabled ? (elapsed % clipDuration) / clipDuration : Math.min(1, elapsed / clipDuration);
-  }, [clip.startTime, clipDuration, clip.loopEnabled, isInPlaybackSession, transport.isPlaying, transport.isPaused]);
-  return useSyncExternalStore(subscribeTransportFrames, getSnapshot, getSnapshot);
-}
-
 function ClipPlayhead({ clip, transport }: { clip: AudioClip; transport: TransportState }) {
-  const progress = useClipPlayheadProgress(clip, transport);
-  if (progress === null) return null;
-  return <div className="arrangement-clip__playhead" style={{ left: `${progress * 100}%` }} />;
+  const element = useRef<HTMLDivElement>(null);
+  const isInPlaybackSession = transport.playingClipIds.includes(clip.id);
+  const clipDuration = clip.endTime - clip.startTime;
+  const visible = isInPlaybackSession &&
+    (transport.isPlaying || transport.isPaused) && clipDuration > 0;
+
+  useEffect(() => {
+    if (!visible) return;
+    const renderPosition = (position: number) => {
+      const playhead = element.current;
+      if (!playhead) return;
+      const elapsed = position - clip.startTime;
+      const inClip = elapsed >= 0 && (clip.loopEnabled || elapsed <= clipDuration);
+      if (!inClip) {
+        playhead.style.opacity = "0";
+        return;
+      }
+      const progress = clip.loopEnabled
+        ? (elapsed % clipDuration) / clipDuration
+        : Math.min(1, elapsed / clipDuration);
+      playhead.style.opacity = "1";
+      const width = playhead.parentElement?.clientWidth ?? 0;
+      playhead.style.transform = `translate3d(${progress * width}px, 0, 0)`;
+    };
+    const unregister = registerTransportFrameRenderer(renderPosition);
+    return () => { unregister(); };
+  }, [clip.startTime, clipDuration, clip.loopEnabled, visible]);
+
+  return visible
+    ? <div ref={element} className="arrangement-clip__playhead" />
+    : null;
 }
 
 /**
@@ -258,14 +272,11 @@ function SectionClip({
   clip: AudioClip;
   sectionStart: number;
   sectionEnd: number;
-  channels: Float32Array[];
+  channels?: Float32Array[];
   transport: TransportState;
 }) {
-  const channel = channels[0];
-
-  if (!channel) return null;
-
-  const path = getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample);
+  const channel = channels?.[0];
+  const path = channel ? getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample) : "";
 
   const sectionDuration = sectionEnd - sectionStart;
 
@@ -279,7 +290,7 @@ function SectionClip({
 
   return (
     <div
-      className={`arrangement-clip arrangement-clip--${clip.stem} ${clip.parentClipId
+      className={`arrangement-clip arrangement-clip--${clip.stem} ${channel ? "" : "arrangement-clip--loading"} ${clip.parentClipId
           ? "arrangement-clip--split"
           : ""
         }`}
@@ -293,14 +304,14 @@ function SectionClip({
     >
       <ClipPlayhead clip={clip} transport={transport} />
 
-      <svg
+      {channel ? <svg
         className="arrangement-clip__waveform"
         viewBox="0 0 180 44"
         preserveAspectRatio="none"
         aria-hidden="true"
       >
         <path d={path} />
-      </svg>
+      </svg> : <span className="arrangement-clip__loading-wave" aria-label="Segment audio loading" />}
 
       <span className="arrangement-clip__label">
         {clip.splitDepth > 0
@@ -588,6 +599,11 @@ export function ArrangementGrid({
   const snapTargets = project.beatSnapMode === "bar"
     ? downbeats.map((beat) => beat.sample)
     : beats.map((beat) => beat.sample);
+  const renderedSections = Object.fromEntries(project.sections.map((section) => [section.id, project.completedSections[section.id] ?? {
+    ...section,
+    sampleRate: markerGrid?.sampleRate ?? timeline?.sampleRate ?? 0,
+    stems: { drums: [], bass: [], other: [], vocals: [] },
+  }])) as typeof project.completedSections;
 
   return (
     <section
@@ -619,7 +635,7 @@ export function ArrangementGrid({
             clips={activeClips.filter(
               clip => clip.stem === track,
             )}
-    sections={project.completedSections}
+            sections={renderedSections}
             selectedClipId={clipState.selectedClipId}
             transport={transport}
             rowCount={rowCount}

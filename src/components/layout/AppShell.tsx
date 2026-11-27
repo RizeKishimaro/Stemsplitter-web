@@ -10,8 +10,9 @@ import {
 
 import { AudioImportScreen } from "../../features/audio-import/components/AudioImportScreen";
 import { audioEngine } from "../../features/audio-engine/AudioEngine";
-import { changeArrangementSegmentSize, recoverBackendJob, startBackendSeparationFromFile } from "../../lib/backendSeparationClient";
 import { getAudioContext } from "../../features/audio-engine/AudioContextManager";
+import { API_BASE_URL } from "../../lib/api";
+import { changeArrangementSegmentSize, recoverBackendJob, restoreLastServerProject, startBackendSeparationFromFile } from "../../lib/backendSeparationClient";
 import { getTransportSnapshot } from "../../stores/transport.store";
 import type { SeparatedSection } from "../../features/stem-separation/separationScheduler";
 import {
@@ -19,11 +20,12 @@ import {
   setImportedAudio,
   setProjectError,
   setProjectStatus,
+  setServerSaveStatus,
   getProjectState,
   restoreProjectSnapshot,
   useProjectStoreSelector,
 } from "../../stores/project.store";
-import { clearLocalProject, loadLocalProject, saveLocalProject } from "../../lib/localProjectStore";
+import { loadLocalProject } from "../../lib/localProjectStore";
 
 import { SongCanvas } from "../../features/song-canvas/components/SongCanvas";
 import { getArrangementRenderCount } from "../../features/song-canvas/components/arrangementMetrics";
@@ -67,7 +69,6 @@ declare global {
 export function AppShell() {
   const project = useProjectStoreSelector((state) => ({
     file: state.file,
-    audio: state.audio,
     analysis: state.analysis,
     masterTimeline: state.masterTimeline,
     beatMarkerGrid: state.beatMarkerGrid,
@@ -76,6 +77,7 @@ export function AppShell() {
     segmentSize: state.segmentSize,
     downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
     sections: state.sections,
+    backendProjectId: state.backendProjectId,
     status: state.status,
   }));
 
@@ -90,16 +92,79 @@ export function AppShell() {
     audioEngine.stop();
   }, []);
 
+  // Debounced server autosave contains only durable timeline and clip data.
+  // Playback position, selection, hover and audio PCM are intentionally absent.
+  useEffect(() => {
+    if (!project.backendProjectId || project.status === "separating" || project.status === "idle") return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const persist = () => {
+      const current = getProjectState();
+      if (!current.backendProjectId || cancelled) return;
+      const clips = Object.values(getClipState().clips).map(({ id, stem, sectionId, sourceStartSample, sourceEndSample, startTime, endTime, parentClipId, childClipIds, splitDepth, active, loopEnabled }) => ({
+        id, stem, sectionId, sourceStartSample, sourceEndSample, startTime, endTime, parentClipId, childClipIds, splitDepth, active, loopEnabled,
+      }));
+      const payload = {
+        project_state: {
+          schemaVersion: 1,
+          analysis: current.analysis,
+          masterTimeline: current.masterTimeline,
+          beatMarkerGrid: current.beatMarkerGrid,
+          timelineCorrections: current.timelineCorrections,
+          beatSnapMode: current.beatSnapMode,
+          downbeatPhaseOffsetSamples: current.downbeatPhaseOffsetSamples,
+          segmentSize: current.segmentSize,
+          sections: current.sections,
+          clips,
+        },
+      };
+      setServerSaveStatus("saving");
+      void fetch(`${API_BASE_URL}/projects/${encodeURIComponent(current.backendProjectId)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(async (response) => {
+        if (!response.ok) throw new Error(`Project save failed (${response.status}): ${await response.text()}`);
+        if (!cancelled) setServerSaveStatus("saved");
+      }).catch((error: unknown) => {
+        if (cancelled) return;
+        setServerSaveStatus("error");
+        console.warn("Could not save DubPad project to server", error);
+      });
+    };
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(persist, 800);
+    };
+    schedule();
+    const unsubscribe = subscribeClips(schedule);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      if (timer) clearTimeout(timer);
+    };
+  }, [project.backendProjectId, project.analysis, project.masterTimeline, project.beatMarkerGrid,
+    project.timelineCorrections, project.beatSnapMode, project.downbeatPhaseOffsetSamples,
+    project.segmentSize, project.sections, project.status]);
+
   useEffect(() => {
     let cancelled = false;
     const recoveryController = new AbortController();
-    void loadLocalProject().then(async (saved) => {
+    void (async () => {
+      try {
+        if (await restoreLastServerProject(recoveryController.signal) || cancelled) return;
+      } catch (error) {
+        if (!recoveryController.signal.aborted) console.warn("Could not restore the server project; checking legacy local data", error);
+      }
+      const saved = await loadLocalProject();
       if (!saved || cancelled || getProjectState().file) return;
       const file = new File([saved.project.file], saved.project.fileName, { type: saved.project.fileType });
       const audio = await getAudioContext().decodeAudioData(await file.arrayBuffer());
       if (cancelled || getProjectState().file) return;
       const restoredState = {
         ...saved.project.state,
+        backendProjectId: null,
+        serverSaveStatus: "idle" as const,
         segmentSize: saved.project.state.segmentSize ?? "4bars" as const,
         status: saved.sections.length ? "ready" as const : "imported" as const,
       };
@@ -136,33 +201,9 @@ export function AppShell() {
             console.warn("Could not restore backend stems and beat grid", error);
           });
       }
-    }).catch((error: unknown) => console.warn("Could not restore local DubPad project", error));
+    })().catch((error: unknown) => console.warn("Could not restore DubPad project", error));
     return () => { cancelled = true; recoveryController.abort(); };
   }, []);
-
-  useEffect(() => {
-    if (!project.file || !project.audio) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const persist = () => {
-      const current = getProjectState();
-      if (current.file && current.audio) {
-        void saveLocalProject(current.file, current, getClipState().clips)
-          .catch((error: unknown) => console.warn("Could not save local DubPad project", error));
-      }
-    };
-    persist();
-    const schedulePersist = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(persist, 200);
-    };
-    const unsubscribe = subscribeClips(schedulePersist);
-    return () => {
-      unsubscribe();
-      if (timer) clearTimeout(timer);
-    };
-  }, [project.file, project.audio, project.analysis, project.masterTimeline, project.beatMarkerGrid,
-    project.timelineCorrections, project.beatSnapMode, project.segmentSize, project.downbeatPhaseOffsetSamples,
-    project.sections, project.status]);
 
   useEffect(() => {
     if (!import.meta.env.DEV || !new URLSearchParams(location.search).has("e2e")) {
@@ -245,26 +286,20 @@ export function AppShell() {
     };
   }, []);
 
-  function handleAudioLoaded(file: File, audio: AudioBuffer) {
+  function handleAudioLoaded(file: File) {
     const importId = ++activeImport.current;
     cancelCurrentJob.current?.();
     cancelCurrentJob.current = null;
     audioEngine.stop();
     audioEngine.clearPreparedBuffers();
     resetClips();
-    void clearLocalProject().then(() => {
-      const current = getProjectState();
-      if (current.file === file) return saveLocalProject(file, current, getClipState().clips);
-    }).catch((error: unknown) => console.warn("Could not replace previous local DubPad project", error));
-
-    // Save the original audio.
-    setImportedAudio(file, audio);
+    setImportedAudio(file);
     setProjectStatus("separating");
     setProcessingMessage("Uploading audio…");
     setProcessingProgress(null);
     const controller = new AbortController();
     cancelCurrentJob.current = () => controller.abort();
-    void startBackendSeparationFromFile(file, audio, "drums_first", {
+    void startBackendSeparationFromFile(file, "drums_first", {
       onProgress: (event) => {
         if (activeImport.current !== importId) return;
         const stage = event.stage ?? event.event ?? event.status ?? "Processing";
@@ -309,7 +344,7 @@ export function AppShell() {
     <div className="app-shell">
       <SongCanvas processingMessage={processingMessage} processingProgress={processingProgress} />
 
-      {!project.audio && (
+      {!project.file && (
         <div className="app-shell__import-overlay">
           <AudioImportScreen
             onAudioLoaded={handleAudioLoaded}

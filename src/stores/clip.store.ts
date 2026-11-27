@@ -66,7 +66,7 @@ export function useClipStore() {
  * Existing clips are preserved when additional sections arrive.
  */
 export function registerSectionClips(
-  section: SeparatedSection,
+  section: SeparatedSection | (Omit<SeparatedSection, "stems"> & { stems?: SeparatedSection["stems"] }),
 ) {
 
   const clips = { ...state.clips };
@@ -84,9 +84,9 @@ export function registerSectionClips(
 
     if (clips[id]) continue;
 
-    const channels = section.stems[stem];
-
-    if (!channels?.length || !channels[0]?.length) continue;
+    const channels = section.stems?.[stem];
+    const frameLength = channels?.[0]?.length ?? section.endSample - section.startSample;
+    if (frameLength <= 0) continue;
 
     clips[id] = {
       id,
@@ -94,7 +94,7 @@ export function registerSectionClips(
       sectionId: section.id,
 
       sourceStartSample: 0,
-      sourceEndSample: channels[0].length,
+      sourceEndSample: frameLength,
 
       startTime: section.startTime,
       endTime: section.endTime,

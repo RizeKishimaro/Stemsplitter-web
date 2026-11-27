@@ -2,6 +2,7 @@
 
 import {
   getAudioContext,
+  getAudioContextDiagnostics,
   resumeAudioContext,
 } from "./AudioContextManager";
 
@@ -55,6 +56,24 @@ class AudioEngine {
   private requestSequence = 0;
   private pendingClipRequests = new Map<string, number>();
   private globallyPaused = false;
+  private lastPlaybackStart: Record<string, number | string | null> | null = null;
+  private frameMetrics = { frames: 0, droppedFrames: 0, maxGapMs: 0, lastFrameAt: 0 };
+  private longTaskMetrics = { count: 0, totalMs: 0, maxMs: 0 };
+  private longTaskObserver: PerformanceObserver | null = null;
+
+  constructor() {
+    if (import.meta.env?.DEV && typeof PerformanceObserver !== "undefined" &&
+      PerformanceObserver.supportedEntryTypes.includes("longtask")) {
+      this.longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          this.longTaskMetrics.count++;
+          this.longTaskMetrics.totalMs += entry.duration;
+          this.longTaskMetrics.maxMs = Math.max(this.longTaskMetrics.maxMs, entry.duration);
+        }
+      });
+      this.longTaskObserver.observe({ type: "longtask", buffered: true });
+    }
+  }
 
   /** Prepare each section once, as it arrives from the separation worker. */
   prepareSection(section: SeparatedSection) {
@@ -139,6 +158,18 @@ class AudioEngine {
         duration: buffer.duration,
         length: buffer.length,
       })),
+      preparedBufferBytes: [...this.preparedBuffers.values()].reduce(
+        (total, buffer) => total + buffer.length * buffer.numberOfChannels * Float32Array.BYTES_PER_ELEMENT,
+        0,
+      ),
+      memory: (() => {
+        const memory = (performance as Performance & { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory;
+        return memory ? { usedJSHeapSize: memory.usedJSHeapSize, totalJSHeapSize: memory.totalJSHeapSize } : null;
+      })(),
+      audioContext: getAudioContextDiagnostics(),
+      playbackStart: this.lastPlaybackStart,
+      frameMetrics: { ...this.frameMetrics, lastFrameAt: 0 },
+      longTaskMetrics: { ...this.longTaskMetrics },
     };
   }
 
@@ -240,6 +271,7 @@ class AudioEngine {
     generation: number,
     scheduleMode: "timeline" | "clip-local" = "timeline",
     clipLocalOffset?: number,
+    startMeasurement?: { requestStartedAtMs: number; resumeDurationMs: number },
   ) {
     if (this.sources.has(clip.id)) return;
 
@@ -372,6 +404,7 @@ class AudioEngine {
       });
     }
 
+    const sourceStartCallAt = import.meta.env.DEV ? performance.now() : 0;
     if (clip.loopEnabled) {
       source.start(scheduledTime, sourceOffset);
     } else {
@@ -387,6 +420,29 @@ class AudioEngine {
         sourceOffset,
         remaining,
       );
+    }
+
+    if (import.meta.env.DEV) {
+      const context = getAudioContext();
+      const estimatedOutputDelayMs = Math.max(0, scheduledTime - context.currentTime) * 1000 +
+        (context.baseLatency + (context.outputLatency ?? 0)) * 1000;
+      this.lastPlaybackStart = {
+        clipId: clip.id,
+        requestToSourceStartMs: startMeasurement
+          ? sourceStartCallAt - startMeasurement.requestStartedAtMs
+          : 0,
+        audioContextResumeMs: startMeasurement?.resumeDurationMs ?? 0,
+        scheduledLeadMs: Math.max(0, scheduledTime - context.currentTime) * 1000,
+        estimatedOutputDelayMs,
+        estimatedClickToAudibleMs: startMeasurement
+          ? sourceStartCallAt - startMeasurement.requestStartedAtMs + estimatedOutputDelayMs
+          : estimatedOutputDelayMs,
+        sampleRate: buffer.sampleRate,
+      };
+      console.debug("[Audio performance] source.start issued", {
+        ...this.lastPlaybackStart,
+        measuredAt: "AudioBufferSourceNode.start call; output delay is estimated from browser latency reports",
+      });
     }
 
     this.sources.set(clip.id, source);
@@ -453,6 +509,7 @@ class AudioEngine {
 
   private startClock() {
     this.cancelClock();
+    if (import.meta.env.DEV) this.frameMetrics.lastFrameAt = 0;
 
     const generation = this.generation;
 
@@ -460,6 +517,16 @@ class AudioEngine {
       if (generation !== this.generation) return;
       if (this.globallyPaused) return;
 
+      if (import.meta.env.DEV) {
+        const now = performance.now();
+        if (this.frameMetrics.lastFrameAt > 0) {
+          const gap = now - this.frameMetrics.lastFrameAt;
+          this.frameMetrics.maxGapMs = Math.max(this.frameMetrics.maxGapMs, gap);
+          if (gap > 25) this.frameMetrics.droppedFrames += Math.max(1, Math.round(gap / (1000 / 60)) - 1);
+        }
+        this.frameMetrics.lastFrameAt = now;
+        this.frameMetrics.frames++;
+      }
       const position = this.getPosition();
       const hasLoopingSource = [...this.sourceSchedules.values()].some((schedule) => schedule.loop);
       publishTransportFrame(hasLoopingSource ? position : Math.min(position, this.duration));
@@ -517,6 +584,7 @@ class AudioEngine {
   }
 
   async playClip(clipId: string) {
+    const requestStartedAtMs = performance.now();
     let clip = getClipState().clips[clipId];
 
     if (!clip?.active) return;
@@ -529,8 +597,11 @@ class AudioEngine {
     const requestId = ++this.requestSequence;
     this.pendingClipRequests.set(clipId, requestId);
     let context: AudioContext;
+    const resumeStartedAtMs = performance.now();
+    let resumeDurationMs: number;
     try {
       context = await resumeAudioContext();
+      resumeDurationMs = performance.now() - resumeStartedAtMs;
     } catch (error) {
       if (this.pendingClipRequests.get(clipId) === requestId) this.pendingClipRequests.delete(clipId);
       throw error;
@@ -612,6 +683,7 @@ class AudioEngine {
       this.generation,
       scheduleMode,
       pausedOffset,
+      { requestStartedAtMs, resumeDurationMs },
     );
     this.pausedLocalOffsets.delete(clipId);
 
@@ -646,13 +718,16 @@ class AudioEngine {
   }
 
   async playArrangement(fromTime = 0) {
+    const requestStartedAtMs = performance.now();
     const clips = Object.values(getClipState().clips)
       .filter(clip => clip.active);
 
     if (!clips.length) return;
 
     const requestGeneration = this.generation;
+    const resumeStartedAtMs = performance.now();
     await resumeAudioContext();
+    const resumeDurationMs = performance.now() - resumeStartedAtMs;
     if (requestGeneration !== this.generation) return;
 
     this.stop();
@@ -679,6 +754,9 @@ class AudioEngine {
         fromTime,
         this.contextStart,
         this.generation,
+        "timeline",
+        undefined,
+        { requestStartedAtMs, resumeDurationMs },
       );
     }
 

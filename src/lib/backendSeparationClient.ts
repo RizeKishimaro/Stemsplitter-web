@@ -4,16 +4,20 @@ import type { SeparationSection, StemName } from "../features/stem-separation/ch
 import type { SeparatedSection } from "../features/stem-separation/separationScheduler";
 import { assembleMasterTimelineSections } from "../features/stem-separation/separationPlan";
 import { getClipState, registerSectionClips, resetClips, setClipLoop } from "../stores/clip.store";
+import { restoreClipSnapshot, type AudioClip } from "../stores/clip.store";
 import {
   finishSeparation,
   getProjectState,
   setArrangementSections,
   setBackendBeatTimeline,
+  addServerSegment,
   setProjectError,
   setProjectStatus,
   setSegmentSizePreference,
+  setBackendProjectId,
+  restoreProjectSnapshot,
+  type ProjectState,
 } from "../stores/project.store";
-import { replaceLocalSections, saveBackendJobId, saveLocalSection } from "./localProjectStore";
 
 export type AnalysisStrategy = "mix_first" | "drums_first";
 const BACKEND_API_BASE = API_BASE_URL;
@@ -74,6 +78,49 @@ type BackendProject = {
   stems: ProjectStem[];
 };
 
+type BackendProjectDetails = {
+  project: { id: string; name: string };
+  project_state: Partial<ProjectState> & { clips?: AudioClip[] | Record<string, AudioClip> };
+  jobs: BackendJob[];
+  audio_assets: Array<{ original_filename: string; content_type: string }>;
+  stems: ProjectStem[];
+};
+
+/** Restore the last server project by ID; audio remains segment-fetched on demand. */
+export async function restoreLastServerProject(signal?: AbortSignal): Promise<boolean> {
+  let projectId: string | null;
+  try { projectId = localStorage.getItem("dubpad:last-server-project"); } catch { return false; }
+  if (!projectId) return false;
+  const response = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}`), { signal });
+  if (response.status === 410) {
+    try { localStorage.removeItem("dubpad:last-server-project"); } catch { /* ignore */ }
+    return false;
+  }
+  const details = await responseJson<BackendProjectDetails>(response, "Could not restore server project");
+  if (details.project.id !== projectId) throw new Error("Server returned a different project ID.");
+  const saved = details.project_state ?? {};
+  const fileInfo = details.audio_assets[0];
+  const placeholder = new File([], fileInfo?.original_filename ?? details.project.name, { type: fileInfo?.content_type ?? "audio/wav" });
+  restoreProjectSnapshot(placeholder, null, {
+    backendProjectId: projectId,
+    serverSaveStatus: "saved",
+    analysis: saved.analysis ?? null,
+    masterTimeline: saved.masterTimeline ?? null,
+    beatMarkerGrid: saved.beatMarkerGrid ?? null,
+    timelineCorrections: saved.timelineCorrections ?? {},
+    beatSnapMode: saved.beatSnapMode ?? "off",
+    downbeatPhaseOffsetSamples: saved.downbeatPhaseOffsetSamples ?? 0,
+    segmentSize: saved.segmentSize ?? "4bars",
+    sections: saved.sections ?? [],
+    status: "imported",
+  }, []);
+  const clips = saved.clips;
+  if (clips) restoreClipSnapshot(Array.isArray(clips) ? Object.fromEntries(clips.map((clip) => [clip.id, clip])) : clips);
+  const latest = details.jobs.find((job) => job.status === "SUCCEEDED") ?? details.jobs[0];
+  if (latest) await recoverBackendJob(latest.id, signal);
+  return true;
+}
+
 type BackendEvent = {
   event?: string;
   stage?: string;
@@ -81,7 +128,101 @@ type BackendEvent = {
   progress?: number;
   message?: string;
   job_id?: string;
+  chunk?: { segmentId?: string };
 };
+
+type SegmentManifestItem = {
+  segmentId: string;
+  segmentIndex: number;
+  barNumber: number | null;
+  startSample: number;
+  endSample: number;
+  sampleRate: number;
+  channels: number;
+  frameCount: number;
+  status: string;
+  stems: Record<StemName, { url: string; sampleRate: number; channels: number; frameCount: number }>;
+};
+
+type ProgressiveJobState = { grid: BeatGrid; loaded: Set<string>; loading: Map<string, Promise<void>>; segmentSize: ArrangementSegmentSize };
+const progressiveJobs = new Map<string, Promise<ProgressiveJobState>>();
+
+async function ensureProgressiveJob(job: BackendJob, signal?: AbortSignal): Promise<ProgressiveJobState> {
+  const existing = progressiveJobs.get(job.id);
+  if (existing) return existing;
+  const initialization = (async () => {
+    const projectId = job.result_metadata?.projectId;
+    if (!projectId || projectId !== job.project_id || !job.result_metadata.analysisUrl) {
+      throw new Error("Job metadata is missing its project or analysis reference.");
+    }
+    const [projectResponse, analysisResponse] = await Promise.all([
+      fetch(apiUrl(`projects/${encodeURIComponent(projectId)}`), { signal }),
+      fetch(apiUrl(job.result_metadata.analysisUrl), { signal }),
+    ]);
+    const project = await responseJson<BackendProject>(projectResponse, "Could not load project metadata");
+    const grid = await responseJson<BeatGrid>(analysisResponse, "Could not load the saved beat grid");
+    if (project.project.id !== projectId || grid.projectId !== projectId || grid.jobId !== job.id || grid.audio.samplePositionUnit !== "frames") {
+      throw new Error("Project, job, and analysis metadata do not describe the same source timeline.");
+    }
+    const segmentSize = getProjectState().segmentSize;
+    audioEngine.stop();
+    audioEngine.clearPreparedBuffers();
+    resetClips();
+    setBackendBeatTimeline(grid, [], segmentSize);
+    return { grid, loaded: new Set<string>(), loading: new Map<string, Promise<void>>(), segmentSize };
+  })();
+  progressiveJobs.set(job.id, initialization);
+  try {
+    return await initialization;
+  } catch (error) {
+    progressiveJobs.delete(job.id);
+    throw error;
+  }
+}
+
+async function loadOneSegment(item: SegmentManifestItem, job: BackendJob, signal?: AbortSignal) {
+  const session = await ensureProgressiveJob(job, signal);
+  if (session.loaded.has(item.segmentId)) return;
+  const inProgress = session.loading.get(item.segmentId);
+  if (inProgress) return inProgress;
+  const load = (async () => {
+  if (item.status !== "READY" || item.sampleRate !== session.grid.audio.sampleRate ||
+    item.channels !== session.grid.audio.channels || item.frameCount !== item.endSample - item.startSample) {
+    throw new Error(`Segment ${item.segmentId} does not match the shared source timeline.`);
+  }
+  const channels: Record<StemName, Float32Array[]> = {} as Record<StemName, Float32Array[]>;
+  for (const stem of STEM_NAMES) {
+    const asset = item.stems[stem];
+    if (!asset || asset.sampleRate !== item.sampleRate || asset.channels !== item.channels || asset.frameCount !== item.frameCount) {
+      throw new Error(`${stem} segment metadata is inconsistent for ${item.segmentId}.`);
+    }
+    const response = await fetch(apiUrl(asset.url), { signal });
+    if (!response.ok) throw new Error(`Could not fetch ${stem} segment ${item.segmentId} (${response.status}).`);
+    channels[stem] = decodeStemWav(await response.arrayBuffer(), {
+      name: stem, sampleRate: item.sampleRate, channels: item.channels, frames: item.frameCount,
+    });
+  }
+  const startBar = Math.max(0, (item.barNumber ?? 1) - 1);
+  const section: SeparatedSection = {
+    id: item.segmentId,
+    index: item.segmentIndex,
+    startBar,
+    endBar: startBar + 1,
+    startSample: item.startSample,
+    endSample: item.endSample,
+    startTime: item.startSample / item.sampleRate,
+    endTime: item.endSample / item.sampleRate,
+    sampleRate: item.sampleRate,
+    stems: channels,
+  };
+  audioEngine.prepareSection(section);
+  addServerSegment(section, session.segmentSize);
+  registerSectionClips(section);
+  session.loaded.add(item.segmentId);
+  })();
+  session.loading.set(item.segmentId, load);
+  try { await load; } finally { session.loading.delete(item.segmentId); }
+}
 
 export type BackendSeparationCallbacks = {
   onProgress?: (event: BackendEvent) => void;
@@ -346,7 +487,8 @@ export async function changeArrangementSegmentSize(segmentSize: ArrangementSegme
       project.masterTimeline.meter,
       segmentSize,
     );
-    await replaceLocalSections(regrouped);
+    // Local PCM may be present only for sections already loaded into memory.
+    // Do not write the derived audio back to IndexedDB.
     audioEngine.stop();
     audioEngine.clearPreparedBuffers();
     resetClips();
@@ -420,19 +562,18 @@ export async function fetchSuccessfulJobAudio(
 }
 
 async function loadSuccessfulJob(job: BackendJob, signal?: AbortSignal): Promise<SeparatedSection[]> {
-  const segmentSize = getProjectState().segmentSize;
-  const { grid, sections } = await fetchSuccessfulJobAudio(job, fetch, signal, segmentSize);
-  audioEngine.stop();
-  audioEngine.clearPreparedBuffers();
-  resetClips();
-  setBackendBeatTimeline(grid, sections, segmentSize);
-  for (const section of sections) {
-    audioEngine.prepareSection(section);
-    registerSectionClips(section);
+  if (job.status !== "SUCCEEDED") throw new Error(`Separation job is ${job.status.toLowerCase()}.`);
+  const session = await ensureProgressiveJob(job, signal);
+  const projectId = job.result_metadata.projectId!;
+  const manifestResponse = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}/segments`), { signal });
+  const manifest = await responseJson<SegmentManifestItem[]>(manifestResponse, "Could not load segment manifest");
+  const ready = manifest.filter((item) => item.status === "READY" && !session.loaded.has(item.segmentId)).sort((a, b) => a.segmentIndex - b.segmentIndex);
+  for (const item of ready) await loadOneSegment(item, job, signal);
+  if (manifest.length === 0) {
+    throw new Error("The job succeeded but its synchronized audio segments are missing.");
   }
-  await Promise.all(sections.map(saveLocalSection));
   finishSeparation();
-  return sections;
+  return Object.values(getProjectState().completedSections).sort((a, b) => a.startSample - b.startSample);
 }
 
 async function getJob(jobId: string, signal?: AbortSignal): Promise<BackendJob> {
@@ -447,7 +588,6 @@ function websocketUrl(path: string) {
 
 export async function startBackendSeparationFromFile(
   file: File,
-  audio: AudioBuffer,
   strategy: AnalysisStrategy,
   callbacks: BackendSeparationCallbacks,
   beatsPerBar = 4,
@@ -459,11 +599,14 @@ export async function startBackendSeparationFromFile(
     signal,
   });
   const project = await responseJson<{ id: string }>(projectResponse, "Could not create backend project");
+  setBackendProjectId(project.id);
   const form = new FormData();
   form.set("file", file, file.name);
-  form.set("sample_rate", String(audio.sampleRate));
-  form.set("channels", String(audio.numberOfChannels));
-  form.set("frame_count", String(audio.length));
+  // The encoded source is authoritative; these valid placeholders are only
+  // retained for compatibility with the current upload contract.
+  form.set("sample_rate", "48000");
+  form.set("channels", "2");
+  form.set("frame_count", "1");
   const uploadResponse = await fetch(apiUrl(`projects/${encodeURIComponent(project.id)}/audio`), { method: "POST", body: form, signal });
   const asset = await responseJson<{ id: string }>(uploadResponse, "Could not upload audio for HTDemucs");
   return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar, signal);
@@ -486,7 +629,6 @@ export async function startBackendSeparation(
     signal,
   });
   const job = await responseJson<BackendJob>(response, "Could not create separation job");
-  await saveBackendJobId(job.id);
   setProjectStatus("separating");
 
   const socket = new WebSocket(websocketUrl(`jobs/${encodeURIComponent(job.id)}/events`));
@@ -529,6 +671,18 @@ export async function startBackendSeparation(
     try {
       const event = JSON.parse(String(message.data)) as BackendEvent;
       callbacks.onProgress?.(event);
+      if (event.event === "segment.ready") {
+        void getJob(job.id, signal).then(async (latest) => {
+          const session = await ensureProgressiveJob(latest, signal);
+          const projectId = latest.result_metadata.projectId;
+          if (!projectId) throw new Error("Segment event job has no project ID.");
+          const response = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}/segments`), { signal });
+          const manifest = await responseJson<SegmentManifestItem[]>(response, "Could not retrieve ready segment manifest");
+          for (const item of manifest.filter((entry) => entry.status === "READY" && !session.loaded.has(entry.segmentId))) {
+            await loadOneSegment(item, latest, signal);
+          }
+        }).catch((error: unknown) => callbacks.onError?.(error instanceof Error ? error : new Error(String(error))));
+      }
       if (event.status === "SUCCEEDED") void complete().catch(() => undefined);
       if (event.status === "FAILED" || event.status === "CANCELLED") {
         manualClose = true;
