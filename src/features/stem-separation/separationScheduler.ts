@@ -3,8 +3,19 @@ import type { SeparationSection, StemName } from "./chunkEngine";
 
 export type SeparationBackend = "wasm" | "webgpu";
 
-export type ServerStemSource = {
+export type ServerStemPart = {
   url: string;
+  sampleRate: number;
+  channels: number;
+  frames: number;
+  startSample: number;
+  endSample: number;
+  audioFormat: "wav";
+};
+
+export type ServerStemSource = {
+  /** Ordered contiguous source segments forming one longer, quantized block. */
+  parts: ServerStemPart[];
   sampleRate: number;
   channels: number;
   frames: number;
