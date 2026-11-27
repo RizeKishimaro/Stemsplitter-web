@@ -664,6 +664,7 @@ class AudioEngine {
       sourceEnd,
       loop: clip.loopEnabled,
     });
+    this.syncTransport();
 
     source.onended = () => {
       source.disconnect();
@@ -699,7 +700,7 @@ class AudioEngine {
       duration: this.duration,
     });
 
-    if (playingClipIds.length === 0) {
+    if (this.activeClipIds.size === 0) {
       this.cancelClock();
       this.mode = null;
       this.globallyPaused = false;
