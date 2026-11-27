@@ -6,7 +6,6 @@ import { assembleMasterTimelineSections } from "../features/stem-separation/sepa
 import { getClipState, registerSectionClips, resetClips, setClipLoop } from "../stores/clip.store";
 import { restoreClipSnapshot, type AudioClip } from "../stores/clip.store";
 import {
-  addSeparatedSection,
   addServerSegment,
   finishSeparation,
   getProjectState,
@@ -18,7 +17,7 @@ import {
   restoreProjectSnapshot,
   type ProjectState,
 } from "../stores/project.store";
-import { replaceLocalSections, saveBackendJobId, saveLocalSection } from "./localProjectStore";
+import { replaceLocalSections, saveBackendJobId } from "./localProjectStore";
 
 export type AnalysisStrategy = "mix_first" | "drums_first";
 const BACKEND_API_BASE = API_BASE_URL;
@@ -503,7 +502,7 @@ export async function startBackendSeparationFromFile(
   return startBackendSeparation(project.id, asset.id, strategy, callbacks, beatsPerBar, signal);
 }
 
-/** Starts HTDemucs and loads the persisted full stems and beat grid after completion. */
+/** Starts HTDemucs and consumes server-published segments plus beat-grid metadata. */
 export async function startBackendSeparation(
   projectId: string,
   audioAssetId: string,
