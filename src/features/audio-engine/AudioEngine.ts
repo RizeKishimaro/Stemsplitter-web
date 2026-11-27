@@ -142,6 +142,11 @@ class AudioEngine {
       audioContextCurrentTime: context.currentTime,
       globalTimelinePosition: this.getPosition(),
       activeSourceCount: this.sources.size,
+      activeClipIds: [...this.activeClipIds],
+      schedulingClipIds: [...this.schedulingClipIds],
+      pendingRemoteLoads: this.remoteBufferLoads.size,
+      activeRemoteLoads: this.activeRemoteLoads,
+      waitingRemoteLoads: this.remoteLoadWaiters.length,
       activeSources: [...this.sourceMixNodes].map(([clipId, source]) => ({
         clipId,
         stem: source.stem,
@@ -417,7 +422,32 @@ class AudioEngine {
     this.schedulingClipIds.add(clip.id);
     return this.scheduleClipNow(
       clip, timelinePosition, startAt, generation, scheduleMode, clipLocalOffset, startMeasurement,
-    ).finally(() => this.schedulingClipIds.delete(clip.id));
+    ).then(() => {
+      // A failed fetch/decode or an invalid source range must not leave a
+      // phantom "playing" clip in the transport. scheduleClipNow can return
+      // without creating a source, so reconcile the transport after it settles.
+      if (
+        generation === this.generation &&
+        this.activeClipIds.has(clip.id) &&
+        !this.sources.has(clip.id)
+      ) {
+        if (import.meta.env.DEV) {
+          console.error("[Audio playback] Clip scheduling finished without an audio source", {
+            clipId: clip.id,
+            stem: clip.stem,
+            sectionId: clip.sectionId,
+            startTime: clip.startTime,
+            endTime: clip.endTime,
+            timelinePosition,
+            scheduleMode,
+          });
+        }
+        this.activeClipIds.delete(clip.id);
+        this.localPlaybackClipIds.delete(clip.id);
+        this.pausedLocalOffsets.delete(clip.id);
+        this.syncTransport();
+      }
+    }).finally(() => this.schedulingClipIds.delete(clip.id));
   }
 
   private async scheduleClipNow(
