@@ -4,6 +4,7 @@ import type { SeparationSection, StemName } from "../features/stem-separation/ch
 import type { SeparatedSection } from "../features/stem-separation/separationScheduler";
 import { assembleMasterTimelineSections } from "../features/stem-separation/separationPlan";
 import { getClipState, registerSectionClips, resetClips, setClipLoop } from "../stores/clip.store";
+import { restoreClipSnapshot, type AudioClip } from "../stores/clip.store";
 import {
   addSeparatedSection,
   finishSeparation,
@@ -13,6 +14,9 @@ import {
   setProjectError,
   setProjectStatus,
   setSegmentSizePreference,
+  setBackendProjectId,
+  restoreProjectSnapshot,
+  type ProjectState,
 } from "../stores/project.store";
 import { replaceLocalSections, saveBackendJobId, saveLocalSection } from "./localProjectStore";
 
@@ -75,6 +79,49 @@ type BackendProject = {
   stems: ProjectStem[];
 };
 
+type BackendProjectDetails = {
+  project: { id: string; name: string };
+  project_state: Partial<ProjectState> & { clips?: AudioClip[] | Record<string, AudioClip> };
+  jobs: BackendJob[];
+  audio_assets: Array<{ original_filename: string; content_type: string }>;
+  stems: ProjectStem[];
+};
+
+/** Restore the last server project by ID; audio remains segment-fetched on demand. */
+export async function restoreLastServerProject(signal?: AbortSignal): Promise<boolean> {
+  let projectId: string | null;
+  try { projectId = localStorage.getItem("dubpad:last-server-project"); } catch { return false; }
+  if (!projectId) return false;
+  const response = await fetch(apiUrl(`projects/${encodeURIComponent(projectId)}`), { signal });
+  if (response.status === 410) {
+    try { localStorage.removeItem("dubpad:last-server-project"); } catch { /* ignore */ }
+    return false;
+  }
+  const details = await responseJson<BackendProjectDetails>(response, "Could not restore server project");
+  if (details.project.id !== projectId) throw new Error("Server returned a different project ID.");
+  const saved = details.project_state ?? {};
+  const fileInfo = details.audio_assets[0];
+  const placeholder = new File([], fileInfo?.original_filename ?? details.project.name, { type: fileInfo?.content_type ?? "audio/wav" });
+  restoreProjectSnapshot(placeholder, null, {
+    backendProjectId: projectId,
+    serverSaveStatus: "saved",
+    analysis: saved.analysis ?? null,
+    masterTimeline: saved.masterTimeline ?? null,
+    beatMarkerGrid: saved.beatMarkerGrid ?? null,
+    timelineCorrections: saved.timelineCorrections ?? {},
+    beatSnapMode: saved.beatSnapMode ?? "off",
+    downbeatPhaseOffsetSamples: saved.downbeatPhaseOffsetSamples ?? 0,
+    segmentSize: saved.segmentSize ?? "4bars",
+    sections: saved.sections ?? [],
+    status: "imported",
+  }, []);
+  const clips = saved.clips;
+  if (clips) restoreClipSnapshot(Array.isArray(clips) ? Object.fromEntries(clips.map((clip) => [clip.id, clip])) : clips);
+  const latest = details.jobs.find((job) => job.status === "SUCCEEDED") ?? details.jobs[0];
+  if (latest) await recoverBackendJob(latest.id, signal);
+  return true;
+}
+
 type BackendStemMetadata = {
   name?: string;
   url?: string;
@@ -93,6 +140,7 @@ type BackendEvent = {
   progress?: number;
   message?: string;
   job_id?: string;
+  chunk?: { segmentId?: string };
   stem?: string;
   stem_metadata?: BackendStemMetadata;
 };
