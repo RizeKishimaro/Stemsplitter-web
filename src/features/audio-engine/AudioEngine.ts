@@ -208,6 +208,52 @@ class AudioEngine {
     return this.preparedBuffers.get(`${clip.sectionId}:${clip.stem}`) ?? null;
   }
 
+  /**
+   * Return normalized peak amplitudes for drawing a lightweight clip waveform.
+   * Reuses the same lazy decoded segment cache as playback, so the browser does
+   * not download a second copy of a segment just to render its waveform.
+   */
+  async getServerWaveformPeaks(
+    sectionId: string,
+    stem: StemName,
+    sampleCount = 90,
+  ): Promise<number[] | null> {
+    const section = getProjectState().completedSections[sectionId];
+    const source = section?.serverStems?.[stem];
+    if (!section || !source) return null;
+
+    const clip: AudioClip = {
+      id: `waveform:${sectionId}:${stem}`,
+      stem,
+      sectionId,
+      sourceStartSample: 0,
+      sourceEndSample: source.frames,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      parentClipId: null,
+      childClipIds: [],
+      splitDepth: 0,
+      active: true,
+      loopEnabled: false,
+    };
+    const buffer = await this.getClipBufferAsync(clip);
+    if (!buffer || buffer.length === 0) return null;
+
+    const channel = buffer.getChannelData(0);
+    const peaks: number[] = [];
+    const count = Math.max(1, Math.floor(sampleCount));
+    for (let i = 0; i < count; i++) {
+      const start = Math.floor((i / count) * channel.length);
+      const end = Math.max(start + 1, Math.floor(((i + 1) / count) * channel.length));
+      let peak = 0;
+      for (let frame = start; frame < Math.min(end, channel.length); frame++) {
+        peak = Math.max(peak, Math.abs(channel[frame]));
+      }
+      peaks.push(peak);
+    }
+    return peaks;
+  }
+
   private async getClipBufferAsync(clip: AudioClip): Promise<AudioBuffer | null> {
     const key = `${clip.sectionId}:${clip.stem}`;
     const cached = this.preparedBuffers.get(key);
