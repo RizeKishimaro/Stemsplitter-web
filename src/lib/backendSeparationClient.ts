@@ -14,6 +14,7 @@ import {
   setProjectError,
   setProjectStatus,
   setSegmentSizePreference,
+  setBackendProjectId,
   restoreProjectSnapshot,
   type ProjectState,
 } from "../stores/project.store";
