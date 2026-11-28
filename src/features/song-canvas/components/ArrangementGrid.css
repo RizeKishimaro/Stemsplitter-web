@@ -106,8 +106,8 @@
   overflow: hidden;
   box-sizing: border-box;
 
-  background: rgba(255, 255, 255, 0.68);
-  border: var(--canvas-line-width, 1px) solid #777;
+  background: #fff;
+  border: var(--canvas-line-width, 1px) solid #1a1a1a;
 
   cursor: pointer;
 
@@ -156,23 +156,19 @@
 
 .arrangement-clip--other {
   color: #e44d9b;
-  background-color: rgba(228, 77, 155, 0.14);
 }
 
 .arrangement-clip--vocals {
   color: #159b6a;
-  background-color: rgba(21, 155, 106, 0.14);
 }
 
-.arrangement-clip--drums { background-color: rgba(230, 75, 50, 0.14); }
-.arrangement-clip--bass { background-color: rgba(40, 104, 232, 0.14); }
 
 .arrangement-processing-clip {
   position: absolute;
   inset: 2px 1px;
   overflow: hidden;
   border: 1px solid currentColor;
-  background-color: rgba(255, 255, 255, 0.58);
+  background-color: #fff;
   color: var(--stem-color);
 }
 
@@ -363,4 +359,206 @@
   pointer-events: none;
   box-shadow: 0 0 3px rgba(255, 255, 255, 0.6);
   will-change: transform;
+}
+
+
+/* =========================================
+   UI COPY: Figma "Bar / Desktop v2" look
+   White tile, dark border, stem-coloured centre line, no text label.
+   ========================================= */
+
+.arrangement-clip::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-50%);
+  background: currentColor;
+  pointer-events: none;
+}
+
+.arrangement-clip__label {
+  display: none;
+}
+
+/* UI copy: hide the debug beat-grid markers (blue beat dots, red downbeat
+   squares and bar numbers) drawn over the bars. Delete this rule to bring them back. */
+.timeline-markers {
+  display: none;
+}
+
+/* UI copy: play button sits in the middle of the bar, with scissors
+   directly to its left and loop directly to its right (Figma spacing:
+   20px buttons, 2px apart). Link, when available, sits right of loop. */
+.arrangement-clip__controls {
+  display: block;
+}
+
+.arrangement-clip__tools {
+  display: contents;
+}
+
+.arrangement-clip__controls .clip-control {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.arrangement-clip__controls .clip-control--cut {
+  left: calc(50% - 22px);
+}
+
+.arrangement-clip__controls .clip-control--loop {
+  left: calc(50% + 22px);
+}
+
+.arrangement-clip__controls .clip-control--link {
+  left: calc(50% + 44px);
+}
+
+/* Bars too narrow for the row fall back to a compact grid, same order. */
+@container (max-width: 70px) {
+  .arrangement-clip__controls {
+    display: grid;
+  }
+
+  .arrangement-clip__controls .clip-control {
+    position: static;
+    transform: none;
+  }
+
+  .arrangement-clip__controls .clip-control--cut { order: 1; }
+  .arrangement-clip__controls .clip-control--play { order: 2; }
+  .arrangement-clip__controls .clip-control--loop { order: 3; }
+  .arrangement-clip__controls .clip-control--link { order: 4; }
+}
+
+/* =========================================
+   UI COPY: Figma icons + hover shadow
+   ========================================= */
+
+/* 16px single-colour icon. The SVG is used as a mask so it takes the
+   button's text colour (dark normally, white when the button is active). */
+.ui-glyph {
+  display: block;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
+}
+
+/* Pause has no Figma icon yet, so draw two bars in the same weight. */
+.ui-glyph--pause {
+  -webkit-mask: none;
+  mask: none;
+  background:
+    linear-gradient(currentColor, currentColor) 3px 1px / 3.5px 14px no-repeat,
+    linear-gradient(currentColor, currentColor) 9.5px 1px / 3.5px 14px no-repeat;
+}
+
+.arrangement-clip__controls .clip-control {
+  color: #1a1a1a;
+  border-color: #1a1a1a;
+}
+
+/* Figma hover state: drop shadow 0 8px 12px rgba(0,0,0,0.32). */
+.arrangement-clip {
+  transition: box-shadow 120ms ease;
+}
+
+.arrangement-clip:hover {
+  z-index: 2;
+  box-shadow: 0 8px 12px rgba(0, 0, 0, 0.32);
+}
+
+/* Rows normally clip anything that spills out of them, which would cut the
+   shadow off. Let the hovered row draw outside itself and sit on top. */
+.arrangement-row:has(.arrangement-clip:hover) {
+  content-visibility: visible;
+  z-index: 5;
+}
+
+/* =========================================
+   UI COPY: selection, playing state, row numbers
+   ========================================= */
+
+/* No purple selection outline. */
+.arrangement-clip-wrapper.is-selected .arrangement-clip {
+  outline: none;
+}
+
+/* Buttons only show while the pointer is over the bar (selecting a bar
+   no longer leaves them stuck on). */
+.arrangement-clip-wrapper.is-selected .arrangement-clip:not(:hover) .arrangement-clip__controls {
+  opacity: 0;
+}
+
+/* Playing: thin dark playhead, and the part already played is tinted
+   with the stem colour. */
+.arrangement-clip__playhead {
+  width: 2px;
+  background: var(--ui-ink, #1a1a1a);
+  box-shadow: none;
+}
+
+.arrangement-clip__playhead::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 100%;
+  width: 4000px;
+  background: currentColor;
+  opacity: 0.18;
+  pointer-events: none;
+}
+
+/* Figma row numbers: JetBrains Mono Bold 10px, 55% ink, centred in the cell. */
+.arrangement-grid__row-numbers {
+  font-family: var(--ui-font);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ui-ink, #1a1a1a);
+}
+
+.arrangement-grid__row-numbers span {
+  justify-content: center;
+  opacity: 0.55;
+}
+
+/* UI copy: pixel snapping (Figma rule): each bar sits 1px right of and 1px
+   below the grid line, 44px tall, so the line stays visible and crisp. */
+.arrangement-clip {
+  top: 1px;
+  height: calc(var(--canvas-grid-size) - 1px);
+}
+
+/* UI copy: no hover animation. Shadow and buttons appear instantly. */
+.arrangement-clip,
+.arrangement-clip__controls {
+  transition: none;
+}
+
+/* UI copy: each row number is centred in the grid cell to the left of its
+   bar, using the same box as the bar (1px below the line, 44px tall). */
+.arrangement-grid__row-numbers {
+  top: 1px;
+  left: -44px;
+  width: 44px;
+  grid-template-columns: 44px;
+  grid-template-rows: repeat(var(--arrangement-rows, 9), 44px);
+  row-gap: 1px;
+  text-align: center;
+  line-height: 1;
+}
+
+.arrangement-grid__row-numbers span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }

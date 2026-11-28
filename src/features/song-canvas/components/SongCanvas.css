@@ -280,3 +280,72 @@
       rgba(241, 233, 220, 0)
     ) 675px 0 / var(--track-width) 30px no-repeat;
 }
+
+/* UI copy: the header row floats over the top of the scrolling area.
+   Only the four track columns (the middle section) stay fixed; the rows
+   scroll up behind the headers, and the row numbers on the left scroll
+   right off the top of the screen. The header carries its own copy of the
+   grid, which stays still, so the bars are hidden behind it. */
+.song-canvas__tracks {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 30;
+  background: none;
+}
+
+/* The header background runs the full width of the screen, solid, with a
+   1px line along the bottom. Bars and row numbers disappear behind it. */
+.song-canvas__tracks::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--arrangement-left));
+  width: max(100vw, calc(var(--arrangement-left) + var(--arrangement-width)));
+  z-index: -1;
+  pointer-events: none;
+  box-sizing: border-box;
+  /* The line is drawn just below the strip (not over it), so the top edge
+     of the first row of bars is never covered. */
+  box-shadow: 0 1px 0 transparent;
+  transition: box-shadow 120ms ease;
+  background-color: var(--canvas-background);
+  background-image: url("../assets/grid-tile.svg");
+  background-size: 45px 45px;
+  background-position-x: calc(50vw - var(--arrangement-left) - 22.5px);
+  background-position-y: -22.5px;
+  background-repeat: repeat;
+}
+
+/* Line only appears once the rows have been scrolled. */
+.song-canvas__content.is-scrolled .song-canvas__tracks::before {
+  box-shadow: 0 1px 0 rgba(26, 26, 26, 0.35);
+}
+
+/* Rows start below the 90px header, so row 01 is the first one you see. */
+.arrangement-scroll .arrangement-grid {
+  margin-top: 90px;
+}
+
+
+/* =========================================
+   UI COPY: pixel snapping
+   The grid tile draws its lines through the middle of a 45px tile, so an
+   offset of 22px (not 22.5px) puts each line exactly on one whole pixel,
+   starting at the column's left edge and at the top of each row.
+   The arrangement's left edge is rounded to a whole pixel for the same reason.
+   ========================================= */
+:root {
+  --arrangement-left: max(0px, round(down, calc(50vw - 405px), 1px));
+}
+
+.arrangement-scroll {
+  background-position-x: calc(var(--arrangement-left) - 22px);
+  background-position-y: -22px;
+}
+
+.song-canvas__tracks::before {
+  background-position-x: calc(var(--arrangement-left) - 22px);
+  background-position-y: -22px;
+}

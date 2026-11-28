@@ -12,6 +12,9 @@ import {
 import { audioEngine } from "../../audio-engine/AudioEngine";
 import "./TrackHeader.css";
 
+// UI copy: the Assign group (loop / split / link) is hidden in the header for now.
+const SHOW_ASSIGN_TOOLS = false;
+
 export type TrackType = "drums" | "bass" | "vocals" | "other";
 
 interface TrackHeaderProps {
@@ -31,22 +34,22 @@ type ControlIcon =
 const tracks = {
   drums: {
     label: "DRUMS",
-    icon: "/icons/icon-drums.svg",
+    icon: "/icons/figma/icon-drums.svg",
     color: "#f0441e",
   },
   bass: {
     label: "BASS",
-    icon: "/icons/icon-bass.svg",
+    icon: "/icons/figma/icon-bass.svg",
     color: "#2850df",
   },
   vocals: {
     label: "VOCALS",
-    icon: "/icons/icon-vocals.svg",
+    icon: "/icons/figma/icon-vocals.svg",
     color: "#159966",
   },
   other: {
     label: "OTHER",
-    icon: "/icons/icon-other.svg",
+    icon: "/icons/figma/icon-other.svg",
     color: "#ed4385",
   },
 } satisfies Record<TrackType, {
@@ -55,7 +58,25 @@ const tracks = {
   color: string;
 }>;
 
+const figmaControlIcons: Partial<Record<ControlIcon, string>> = {
+  scissors: "/icons/figma/btn-scissors.svg",
+  link: "/icons/figma/btn-link.svg",
+  curve: "/icons/figma/btn-loop.svg",
+};
+
 function ControlGlyph({ name }: { name: ControlIcon }) {
+  // UI copy: use the Figma icon where one exists.
+  const figmaIcon = figmaControlIcons[name];
+  if (figmaIcon) {
+    return (
+      <span
+        className="ui-glyph"
+        style={{ "--icon": `url(${figmaIcon})` } as React.CSSProperties}
+        aria-hidden="true"
+      />
+    );
+  }
+
   const common = {
     fill: "none",
     stroke: "currentColor",
@@ -140,6 +161,9 @@ function ToolButton({
   active?: boolean;
   onClick?: () => void;
 }) {
+  // UI copy: unavailable tools are hidden rather than shown greyed out.
+  if (disabled) return null;
+
   return (
     <button
       type="button"
@@ -202,16 +226,12 @@ export function TrackHeader({ type }: TrackHeaderProps) {
     >
       <div className="track-header__identity">
         <div className="track-header__icon">
-          <img src={track.icon} alt="" draggable={false} />
-
-          {type === "bass" && (
-            <img
-              className="track-header__bass-detail"
-              src="/icons/icon-bass-detail.svg"
-              alt=""
-              draggable={false}
-            />
-          )}
+          {/* UI copy: Figma stem icon, tinted with the track colour */}
+          <span
+            className="track-header__glyph"
+            style={{ "--icon": `url(${track.icon})` } as React.CSSProperties}
+            aria-hidden="true"
+          />
         </div>
 
         <span className="track-header__name">{track.label}</span>
@@ -255,7 +275,8 @@ export function TrackHeader({ type }: TrackHeaderProps) {
           </div>
         </div>
 
-        {/* ASSIGN */}
+        {/* ASSIGN (UI copy: hidden for now, flip SHOW_ASSIGN_TOOLS to bring it back) */}
+        {SHOW_ASSIGN_TOOLS && (
         <div className="track-header__group track-header__group--assign">
           <div className="track-header__group-label">
             Assign
@@ -284,12 +305,6 @@ export function TrackHeader({ type }: TrackHeaderProps) {
             />
 
             <ToolButton
-              icon="back"
-              label="Move back (not implemented yet)"
-              disabled
-            />
-
-            <ToolButton
               icon="link"
               label={
                 canLink
@@ -302,19 +317,7 @@ export function TrackHeader({ type }: TrackHeaderProps) {
           </div>
         </div>
 
-        {/* MASTER */}
-        <div className="track-header__group track-header__group--master">
-          <div className="track-header__group-label">
-            Master
-          </div>
-
-          <div className="track-header__group-buttons">
-            <ToolButton icon="speaker" label="Volume (not implemented yet)" disabled />
-            <ToolButton icon="master" label="Master control (not implemented yet)" disabled />
-            <ToolButton icon="curve" label="Curve (not implemented yet)" disabled />
-            <ToolButton icon="download" label="Download (not implemented yet)" disabled />
-          </div>
-        </div>
+        )}
       </div>
     </header>
   );

@@ -8,6 +8,9 @@ import { ArrangementGrid } from "./ArrangementGrid";
 import "./SongCanvas.css";
 import "./TrackHeader.css";
 
+// UI copy: set to true to bring back the Snap / Segment / Downbeat phase debug bar.
+const SHOW_DEBUG_TOOLS = false;
+
 const trackTypes: TrackType[] = ["drums", "bass", "other", "vocals"];
 
 type SongCanvasProps = {
@@ -30,6 +33,7 @@ export function SongCanvas({ processingMessage, processingProgress }: SongCanvas
   return (
     <section className="song-canvas">
       <GridBackground />
+      {SHOW_DEBUG_TOOLS && (
       <div className="beat-grid-tools" aria-label="Timeline settings">
         <label>
           <span>Snap</span>
@@ -88,6 +92,7 @@ export function SongCanvas({ processingMessage, processingProgress }: SongCanvas
         </span>
         {settingsMessage && <span className="beat-grid-tools__message" role="status">{settingsMessage}</span>}
       </div>
+      )}
 
       {project.status === "separating" && (
         <div className="song-canvas__processing" role="status" aria-live="polite">
@@ -110,7 +115,16 @@ export function SongCanvas({ processingMessage, processingProgress }: SongCanvas
         <div className="song-canvas__tracks">
           {trackTypes.map((type) => <TrackHeader key={type} type={type} />)}
         </div>
-        <div className="arrangement-scroll">
+        <div
+          className="arrangement-scroll"
+          onScroll={(event) => {
+            // UI copy: only show the header's bottom line once the rows have scrolled.
+            event.currentTarget.parentElement?.classList.toggle(
+              "is-scrolled",
+              event.currentTarget.scrollTop > 0,
+            );
+          }}
+        >
           <div className="arrangement-scroll__content">
             <ArrangementGrid
               processingProgress={processingProgress}
