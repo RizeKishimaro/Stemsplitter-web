@@ -42,6 +42,7 @@ declare global {
       resume: () => Promise<void>;
       seek: (position: number) => void;
       stop: () => void;
+      clearPreparedBuffers: () => void;
       installSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
       installRemoteSyntheticProject: (durationSeconds: number) => string[];
       replaceSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
@@ -279,6 +280,7 @@ export function AppShell() {
       resume: () => audioEngine.resume(),
       seek: (position) => audioEngine.seek(position),
       stop: () => audioEngine.stop(),
+      clearPreparedBuffers: () => audioEngine.clearPreparedBuffers(),
       installSyntheticProject,
       installRemoteSyntheticProject,
       replaceSyntheticProject: installSyntheticProject,
