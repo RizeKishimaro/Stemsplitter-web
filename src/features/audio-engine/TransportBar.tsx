@@ -1,6 +1,6 @@
 
 import { audioEngine } from "./AudioEngine";
-import { useTransportStore } from "../../stores/transport.store";
+import { useTransportPosition, useTransportStore } from "../../stores/transport.store";
 import "./TransportBar.css";
 
 function formatTime(seconds: number) {
@@ -12,9 +12,10 @@ function formatTime(seconds: number) {
 
 export function TransportBar() {
   const transport = useTransportStore();
+  const currentTime = useTransportPosition();
 
   const progress = transport.duration > 0
-    ? (transport.currentTime / transport.duration) * 100
+    ? (currentTime / transport.duration) * 100
     : 0;
 
   return (
@@ -39,7 +40,7 @@ export function TransportBar() {
       </div>
 
       <div className="transport-bar__timeline">
-        <span>{formatTime(transport.currentTime)}</span>
+        <span>{formatTime(currentTime)}</span>
 
         <div className="transport-bar__progress">
           <div
@@ -56,9 +57,10 @@ export function TransportBar() {
           ? "PLAYING"
           : transport.isPaused
             ? "PAUSED"
-            : "STOPPED"}
+            : transport.isBuffering
+              ? "BUFFERING"
+              : "STOPPED"}
       </span>
     </div>
   );
 }
-

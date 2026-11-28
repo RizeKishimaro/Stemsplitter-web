@@ -1,8 +1,9 @@
 {
   "name": "soniclab-web",
   "private": true,
-  "version": "10.0.0",
+  "version": "10.2.0",
   "type": "module",
+  "packageManager": "pnpm@11.5.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

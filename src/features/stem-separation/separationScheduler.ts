@@ -3,6 +3,25 @@ import type { SeparationSection, StemName } from "./chunkEngine";
 
 export type SeparationBackend = "wasm" | "webgpu";
 
+export type ServerStemPart = {
+  url: string;
+  sampleRate: number;
+  channels: number;
+  frames: number;
+  startSample: number;
+  endSample: number;
+  audioFormat: "wav";
+};
+
+export type ServerStemSource = {
+  /** Ordered contiguous source segments forming one longer, quantized block. */
+  parts: ServerStemPart[];
+  sampleRate: number;
+  channels: number;
+  frames: number;
+  audioFormat: "wav";
+};
+
 export type SeparatedSection = {
   id: string;
   index: number;
@@ -13,6 +32,9 @@ export type SeparatedSection = {
   startSample: number;
   endSample: number;
   sampleRate: number;
+  kind?: SeparationSection["kind"];
+  /** Server-owned audio is fetched only when a clip needs playback. */
+  serverStems?: Partial<Record<StemName, ServerStemSource>>;
   stems: Record<StemName, Float32Array[]>;
 };
 

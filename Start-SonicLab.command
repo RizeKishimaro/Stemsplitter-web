@@ -1,5 +1,5 @@
 #!/bin/bash
-# SonicLab 10.0 — Kermit the Frog 🐸
+# DubPad — Kermit the Frog 🐸
 # One-file macOS bootstrapper for https://github.com/RizeKishimaro/Stemsplitter-web
 
 set -Eeuo pipefail
@@ -17,7 +17,7 @@ on_error(){ local code=$?; printf "\n${RED}Setup stopped (exit %s).${RESET}\n" "
 trap on_error ERR
 
 clear || true
-printf "${GREEN}SonicLab 10.0 — KERMIT THE FROG 🐸${RESET}\n\n"
+printf "${GREEN}DubPad — KERMIT THE FROG 🐸${RESET}\n\n"
 [[ "$(uname -s)" == "Darwin" ]] || die "This installer is for macOS only."
 command -v xcode-select >/dev/null 2>&1 || die "Install Xcode Command Line Tools first: xcode-select --install"
 if ! xcode-select -p >/dev/null 2>&1; then xcode-select --install || true; die "Complete Xcode Command Line Tools installation, then rerun setup."; fi
@@ -79,7 +79,7 @@ cat > "$PROJECT_DIR/Start-SonicLab.command" <<'LAUNCHER'
 set -Eeuo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
-printf '\033[0;32mSonicLab 10.0 — Kermit the Frog 🐸\033[0m\n\n'
+printf '\033[0;32mDubPad — Kermit the Frog 🐸\033[0m\n\n'
 command -v node >/dev/null 2>&1 || { echo 'Node.js missing; rerun Setup-SonicLab.command.'; read -r; exit 1; }
 command -v pnpm >/dev/null 2>&1 || { echo 'pnpm missing; rerun Setup-SonicLab.command.'; read -r; exit 1; }
 [[ -d node_modules ]] || pnpm install --frozen-lockfile
@@ -91,7 +91,7 @@ URL='http://127.0.0.1:5173'
 ( sleep 2; open "$URL" ) >/dev/null 2>&1 &
 echo "Opening $URL"
 echo 'Vite provides the required cross-origin isolation headers for audio workers.'
-echo 'Press Ctrl+C to stop SonicLab.'
+echo 'Press Ctrl+C to stop DubPad.'
 echo
 pnpm dev
 LAUNCHER
@@ -106,21 +106,21 @@ pnpm lint
 good "ESLint passed"
 
 echo
-good "SonicLab 10.0 setup completed"
+good "DubPad setup completed"
 echo "Project: $PROJECT_DIR"
 echo "Launcher: $PROJECT_DIR/Start-SonicLab.command"
 echo
 echo 'Git status:'
 git status --short
-if ask "Create release commit 'SonicLab 10.0 — Kermit the Frog'?"; then
+if ask "Create release commit 'DubPad — Kermit the Frog'?"; then
   # Stage only release/setup files, not unrelated work.
   git add package.json Start-SonicLab.command
   if ! git diff --cached --quiet; then
-    git commit -m "release: SonicLab 10.0 — Kermit the Frog"
+    git commit -m "release: DubPad — Kermit the Frog"
     good "Release commit created"
   else warn "No release changes to commit."; fi
 else warn "Skipped commit; changes remain in your working tree."; fi
 
 echo
-echo 'Double-click Start-SonicLab.command to launch SonicLab.'
+echo 'Double-click Start-SonicLab.command to launch DubPad.'
 read -r -p 'Press Enter to close...'

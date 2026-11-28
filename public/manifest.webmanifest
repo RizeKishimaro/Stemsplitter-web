@@ -1,0 +1,17 @@
+{
+  "name": "DubPad — Stem Remix Workstation",
+  "short_name": "DubPad",
+  "description": "Browser-based stem separation, beat analysis, and music remix workstation.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f4efdf",
+  "theme_color": "#111111",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

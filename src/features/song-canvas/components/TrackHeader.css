@@ -59,14 +59,14 @@
 
 .track-header--vocals .track-header__icon > img:first-child {
   filter: brightness(0) saturate(100%)
-    invert(43%) sepia(73%) saturate(1700%)
-    hue-rotate(290deg) brightness(100%);
+    invert(40%) sepia(83%) saturate(600%)
+    hue-rotate(105deg) brightness(90%);
 }
 
 .track-header--other .track-header__icon > img:first-child {
   filter: brightness(0) saturate(100%)
-    invert(40%) sepia(83%) saturate(600%)
-    hue-rotate(105deg) brightness(90%);
+    invert(43%) sepia(73%) saturate(1700%)
+    hue-rotate(290deg) brightness(100%);
 }
 
 .track-header__icon .track-header__bass-detail {

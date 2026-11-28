@@ -2,6 +2,7 @@
 
 import {
   getAudioContext,
+  getAudioContextDiagnostics,
   resumeAudioContext,
 } from "./AudioContextManager";
 
@@ -9,6 +10,7 @@ import { getProjectState } from "../../stores/project.store";
 import type { SeparatedSection } from "../stem-separation/separationScheduler";
 import type { StemName } from "../stem-separation/chunkEngine";
 import {
+  mapSourceSampleRate,
   mapTimelineToClipSource,
   sourceRangeMatchesTimeline,
 } from "./sourceMapping";
@@ -22,6 +24,7 @@ import {
   getTransportState,
   updateTransport,
   resetTransport,
+  publishTransportFrame,
   type PlaybackMode,
 } from "../../stores/transport.store";
 
@@ -37,7 +40,16 @@ class AudioEngine {
     loop: boolean;
   }>();
   private preparedBuffers = new Map<string, AudioBuffer>();
+  private remoteBufferLoads = new Map<string, Promise<AudioBuffer | null>>();
+  private remoteBufferKeys = new Set<string>();
+  private readonly maxRemoteBuffers = 24;
+  private activeRemoteLoads = 0;
+  private remoteLoadWaiters: Array<() => void> = [];
   private activeClipIds = new Set<string>();
+  private schedulingClipIds = new Set<string>();
+  private schedulingSectionIds = new Set<string>();
+  private sectionRetryAt = new Map<string, number>();
+  private sectionRetryCount = new Map<string, number>();
   private localPlaybackClipIds = new Set<string>();
   private pausedLocalOffsets = new Map<string, number>();
   private mutedStems = new Set<StemName>();
@@ -51,7 +63,28 @@ class AudioEngine {
 
   private animationFrame = 0;
   private generation = 0;
+  private requestSequence = 0;
+  private pendingClipRequests = new Map<string, number>();
   private globallyPaused = false;
+  private waitingForAudio = false;
+  private lastPlaybackStart: Record<string, number | string | null> | null = null;
+  private frameMetrics = { frames: 0, droppedFrames: 0, maxGapMs: 0, lastFrameAt: 0 };
+  private longTaskMetrics = { count: 0, totalMs: 0, maxMs: 0 };
+  private longTaskObserver: PerformanceObserver | null = null;
+
+  constructor() {
+    if (import.meta.env?.DEV && typeof PerformanceObserver !== "undefined" &&
+      PerformanceObserver.supportedEntryTypes.includes("longtask")) {
+      this.longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          this.longTaskMetrics.count++;
+          this.longTaskMetrics.totalMs += entry.duration;
+          this.longTaskMetrics.maxMs = Math.max(this.longTaskMetrics.maxMs, entry.duration);
+        }
+      });
+      this.longTaskObserver.observe({ type: "longtask", buffered: true });
+    }
+  }
 
   /** Prepare each section once, as it arrives from the separation worker. */
   prepareSection(section: SeparatedSection) {
@@ -80,9 +113,7 @@ class AudioEngine {
         section.sampleRate,
       );
       for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-        buffer.getChannelData(channel).set(
-          Float32Array.from(channels[channel].subarray(0, frameCount)),
-        );
+        buffer.getChannelData(channel).set(channels[channel].subarray(0, frameCount));
       }
       this.preparedBuffers.set(key, buffer);
 
@@ -103,6 +134,8 @@ class AudioEngine {
 
   clearPreparedBuffers() {
     this.preparedBuffers.clear();
+    this.remoteBufferLoads.clear();
+    this.remoteBufferKeys.clear();
   }
 
   /** Browser E2E diagnostics; production callers receive no PCM metadata. */
@@ -114,17 +147,47 @@ class AudioEngine {
       audioContextCurrentTime: context.currentTime,
       globalTimelinePosition: this.getPosition(),
       activeSourceCount: this.sources.size,
+      activeClipIds: [...this.activeClipIds],
+      schedulingClipIds: [...this.schedulingClipIds],
+      pendingRemoteLoads: this.remoteBufferLoads.size,
+      activeRemoteLoads: this.activeRemoteLoads,
+      waitingRemoteLoads: this.remoteLoadWaiters.length,
       activeSources: [...this.sourceMixNodes].map(([clipId, source]) => ({
         clipId,
         stem: source.stem,
         effectiveGain: this.effectiveStemGain(source.stem),
       })),
+      activeSchedules: [...this.sourceSchedules].map(([clipId, schedule]) => {
+        const clip = getClipState().clips[clipId];
+        const sampleRate = clip ? this.getClipBuffer(clip)?.sampleRate ?? 0 : 0;
+        return {
+          clipId,
+          scheduledContextTime: schedule.scheduledTime,
+          sourceOffsetSeconds: schedule.sourceOffset,
+          sourceOffsetSamples: Math.round(schedule.sourceOffset * sampleRate),
+          sourceStartSeconds: schedule.sourceStart,
+          sourceEndSeconds: schedule.sourceEnd,
+          looping: schedule.loop,
+        };
+      }),
       preparedBuffers: [...this.preparedBuffers].map(([key, buffer]) => ({
         key,
         sampleRate: buffer.sampleRate,
         duration: buffer.duration,
         length: buffer.length,
       })),
+      preparedBufferBytes: [...this.preparedBuffers.values()].reduce(
+        (total, buffer) => total + buffer.length * buffer.numberOfChannels * Float32Array.BYTES_PER_ELEMENT,
+        0,
+      ),
+      memory: (() => {
+        const memory = (performance as Performance & { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory;
+        return memory ? { usedJSHeapSize: memory.usedJSHeapSize, totalJSHeapSize: memory.totalJSHeapSize } : null;
+      })(),
+      audioContext: getAudioContextDiagnostics(),
+      playbackStart: this.lastPlaybackStart,
+      frameMetrics: { ...this.frameMetrics, lastFrameAt: 0 },
+      longTaskMetrics: { ...this.longTaskMetrics },
     };
   }
 
@@ -133,7 +196,7 @@ class AudioEngine {
 
     const context = getAudioContext();
 
-    if (this.globallyPaused || context.state !== "running") {
+    if (this.globallyPaused || this.waitingForAudio || context.state !== "running") {
       return this.pausedPosition;
     }
 
@@ -156,6 +219,137 @@ class AudioEngine {
 
   private getClipBuffer(clip: AudioClip): AudioBuffer | null {
     return this.preparedBuffers.get(`${clip.sectionId}:${clip.stem}`) ?? null;
+  }
+
+  /**
+   * Return normalized peak amplitudes for drawing a lightweight clip waveform.
+   * Reuses the same lazy decoded segment cache as playback, so the browser does
+   * not download a second copy of a segment just to render its waveform.
+   */
+  async getServerWaveformPeaks(
+    sectionId: string,
+    stem: StemName,
+    sampleCount = 90,
+  ): Promise<number[] | null> {
+    const section = getProjectState().completedSections[sectionId];
+    const source = section?.serverStems?.[stem];
+    if (!section || !source) return null;
+
+    const clip: AudioClip = {
+      id: `waveform:${sectionId}:${stem}`,
+      stem,
+      sectionId,
+      sourceStartSample: 0,
+      sourceEndSample: source.frames,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      parentClipId: null,
+      childClipIds: [],
+      splitDepth: 0,
+      active: true,
+      loopEnabled: false,
+    };
+    const buffer = await this.getClipBufferAsync(clip);
+    if (!buffer || buffer.length === 0) return null;
+
+    const channel = buffer.getChannelData(0);
+    const peaks: number[] = [];
+    const count = Math.max(1, Math.floor(sampleCount));
+    for (let i = 0; i < count; i++) {
+      const start = Math.floor((i / count) * channel.length);
+      const end = Math.max(start + 1, Math.floor(((i + 1) / count) * channel.length));
+      let peak = 0;
+      for (let frame = start; frame < Math.min(end, channel.length); frame++) {
+        peak = Math.max(peak, Math.abs(channel[frame]));
+      }
+      peaks.push(peak);
+    }
+    return peaks;
+  }
+
+  private async acquireRemoteLoadSlot(): Promise<() => void> {
+    if (this.activeRemoteLoads < 4) {
+      this.activeRemoteLoads++;
+    } else {
+      await new Promise<void>((resolve) => this.remoteLoadWaiters.push(resolve));
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.remoteLoadWaiters.shift();
+      if (next) next();
+      else this.activeRemoteLoads = Math.max(0, this.activeRemoteLoads - 1);
+    };
+  }
+
+  private async getClipBufferAsync(clip: AudioClip): Promise<AudioBuffer | null> {
+    const key = `${clip.sectionId}:${clip.stem}`;
+    const cached = this.preparedBuffers.get(key);
+    if (cached) {
+      if (this.remoteBufferKeys.has(key)) {
+        this.remoteBufferKeys.delete(key);
+        this.remoteBufferKeys.add(key);
+      }
+      return cached;
+    }
+    const source = getProjectState().completedSections[clip.sectionId]?.serverStems?.[clip.stem];
+    if (!source) return null;
+    const pending = this.remoteBufferLoads.get(key);
+    if (pending) return pending;
+
+    const load = (async () => {
+      const releaseSlot = await this.acquireRemoteLoadSlot();
+      try {
+        const context = getAudioContext();
+        const parts: AudioBuffer[] = [];
+        let previousEndSample: number | null = null;
+        for (const part of source.parts) {
+        if (previousEndSample !== null && part.startSample !== previousEndSample) {
+          throw new Error(`Server stem block ${clip.sectionId} has a gap or overlap between source segments.`);
+        }
+        const response = await fetch(part.url);
+        if (!response.ok) throw new Error(`Could not fetch ${clip.stem} segment ${clip.sectionId} (${response.status}).`);
+        const bytes = await response.arrayBuffer();
+        const decoded = await context.decodeAudioData(bytes.slice(0));
+        const expectedDuration = part.frames / part.sampleRate;
+        if (decoded.numberOfChannels !== part.channels ||
+          Math.abs(decoded.duration - expectedDuration) > 1 / part.sampleRate) {
+          throw new Error(`Decoded ${clip.stem} segment duration/channels do not match its manifest.`);
+        }
+        parts.push(decoded);
+        previousEndSample = part.endSample;
+      }
+      if (!parts.length) return null;
+      const totalFrames = parts.reduce((sum, part) => sum + part.length, 0);
+      const channels = Math.min(2, source.channels);
+      const combined = context.createBuffer(channels, totalFrames, context.sampleRate);
+      let writeOffset = 0;
+      for (const part of parts) {
+        for (let channel = 0; channel < channels; channel++) {
+          combined.getChannelData(channel).set(part.getChannelData(channel), writeOffset);
+        }
+        writeOffset += part.length;
+      }
+      this.preparedBuffers.set(key, combined);
+      this.remoteBufferKeys.add(key);
+      while (this.remoteBufferKeys.size > this.maxRemoteBuffers) {
+        const oldest = this.remoteBufferKeys.values().next().value as string | undefined;
+        if (!oldest) break;
+        this.remoteBufferKeys.delete(oldest);
+        this.preparedBuffers.delete(oldest);
+      }
+        return combined;
+      } finally {
+        releaseSlot();
+      }
+    })();
+    this.remoteBufferLoads.set(key, load);
+    try {
+      return await load;
+    } finally {
+      if (this.remoteBufferLoads.get(key) === load) this.remoteBufferLoads.delete(key);
+    }
   }
 
   private effectiveStemGain(stem: StemName): number {
@@ -192,19 +386,32 @@ class AudioEngine {
     const clip = { ...storedClip, loopEnabled: enabled };
 
     const sourceOffset = this.getCurrentSourceOffset(clipId);
+    const wasLocalPlayback = this.localPlaybackClipIds.has(clipId);
     const context = getAudioContext();
     const scheduledTime = context.currentTime + 0.03;
     const generation = this.generation;
     this.stopSource(clipId);
-    this.localPlaybackClipIds.add(clipId);
-    this.scheduleClip(
+    if (wasLocalPlayback) this.localPlaybackClipIds.add(clipId);
+    else this.localPlaybackClipIds.delete(clipId);
+    void this.scheduleClip(
       clip,
-      this.getPosition(),
+      wasLocalPlayback
+        ? this.getPosition()
+        : this.getPosition() + (scheduledTime - context.currentTime),
       scheduledTime,
       generation,
-      "clip-local",
-      sourceOffset,
-    );
+      wasLocalPlayback ? "clip-local" : "timeline",
+      wasLocalPlayback
+        ? sourceOffset + (scheduledTime - context.currentTime)
+        : undefined,
+    ).then(() => {
+      if (!this.sources.has(clipId) && generation === this.generation) {
+        this.activeClipIds.delete(clipId);
+        this.localPlaybackClipIds.delete(clipId);
+        this.pausedLocalOffsets.delete(clipId);
+        this.syncTransport();
+      }
+    });
   }
 
   private scheduleClip(
@@ -214,19 +421,91 @@ class AudioEngine {
     generation: number,
     scheduleMode: "timeline" | "clip-local" = "timeline",
     clipLocalOffset?: number,
+    startMeasurement?: { requestStartedAtMs: number; resumeDurationMs: number },
+  ): Promise<void> {
+    if (this.sources.has(clip.id) || this.schedulingClipIds.has(clip.id)) return Promise.resolve();
+    this.schedulingClipIds.add(clip.id);
+    return this.scheduleClipNow(
+      clip, timelinePosition, startAt, generation, scheduleMode, clipLocalOffset, startMeasurement,
+    ).then(() => {
+      // A failed fetch/decode or an invalid source range must not leave a
+      // phantom "playing" clip in the transport. scheduleClipNow can return
+      // without creating a source, so reconcile the transport after it settles.
+      if (
+        generation === this.generation &&
+        this.activeClipIds.has(clip.id) &&
+        !this.sources.has(clip.id)
+      ) {
+        if (import.meta.env.DEV) {
+          console.error("[Audio playback] Clip scheduling finished without an audio source", {
+            clipId: clip.id,
+            stem: clip.stem,
+            sectionId: clip.sectionId,
+            startTime: clip.startTime,
+            endTime: clip.endTime,
+            timelinePosition,
+            scheduleMode,
+          });
+        }
+        this.activeClipIds.delete(clip.id);
+        this.localPlaybackClipIds.delete(clip.id);
+        this.pausedLocalOffsets.delete(clip.id);
+        this.syncTransport();
+      }
+    }).finally(() => this.schedulingClipIds.delete(clip.id));
+  }
+
+  private async scheduleClipNow(
+    clip: AudioClip,
+    timelinePosition: number,
+    startAt: number,
+    generation: number,
+    scheduleMode: "timeline" | "clip-local" = "timeline",
+    clipLocalOffset?: number,
+    startMeasurement?: { requestStartedAtMs: number; resumeDurationMs: number },
   ) {
     if (this.sources.has(clip.id)) return;
+    const requestContextTime = getAudioContext().currentTime;
 
     const clipDuration = clip.endTime - clip.startTime;
 
     if (clipDuration <= 0) return;
 
-    const buffer = this.getClipBuffer(clip);
+    let buffer = this.getClipBuffer(clip);
+    if (!buffer) {
+      try {
+        buffer = await this.getClipBufferAsync(clip);
+      } catch (error) {
+        console.error("[Audio playback] Could not load server segment:", error);
+        return;
+      }
+      if (!buffer || generation !== this.generation || this.sources.has(clip.id) || !getClipState().clips[clip.id]?.active) return;
+      const context = getAudioContext();
+      if (scheduleMode === "timeline" && this.mode === "arrangement" &&
+        generation === this.generation && !this.globallyPaused) {
+        // Rebase late network/decode completion onto the ONE arrangement clock.
+        // Never add each clip's private load duration to its start time: that
+        // makes every stem drift by a different amount.
+        timelinePosition = this.getPosition();
+        startAt = context.currentTime + 0.03;
+      } else {
+        const elapsed = Math.max(0, context.currentTime - requestContextTime);
+        timelinePosition += elapsed;
+        if (scheduleMode === "clip-local" && clipLocalOffset !== undefined) {
+          clipLocalOffset += elapsed;
+        }
+      }
+    }
 
-    if (!buffer) return;
-
-    const sourceStartSample = Math.max(0, clip.sourceStartSample);
-    const sourceEndSample = Math.min(buffer.length, clip.sourceEndSample);
+    // Remote WAV decoding resamples to the shared AudioContext rate. Clip
+    // metadata remains in the source stem's frame clock, so convert both
+    // endpoints before using AudioBuffer-local sample offsets.
+    const sourceRate = getProjectState().completedSections[clip.sectionId]?.sampleRate ?? buffer.sampleRate;
+    const mappedStart = mapSourceSampleRate(clip.sourceStartSample, sourceRate, buffer.sampleRate);
+    const mappedEnd = mapSourceSampleRate(clip.sourceEndSample, sourceRate, buffer.sampleRate);
+    if (mappedStart === null || mappedEnd === null) return;
+    const sourceStartSample = mappedStart;
+    const sourceEndSample = Math.min(buffer.length, mappedEnd);
     if (sourceEndSample <= sourceStartSample) return;
 
     const sourceStart = sourceStartSample / buffer.sampleRate;
@@ -263,6 +542,8 @@ class AudioEngine {
     let sourceOffset = scheduleMode === "clip-local"
       ? clipLocalOffset ?? sourceStart
       : mappedSource!.sourceOffsetSeconds;
+
+    if (!Number.isFinite(sourceOffset) || sourceOffset < sourceStart || sourceOffset > buffer.duration) return;
 
     // If the playhead has passed this clip, only a looping clip
     // can continue from its wrapped position.
@@ -344,6 +625,7 @@ class AudioEngine {
       });
     }
 
+    const sourceStartCallAt = import.meta.env.DEV ? performance.now() : 0;
     if (clip.loopEnabled) {
       source.start(scheduledTime, sourceOffset);
     } else {
@@ -361,6 +643,29 @@ class AudioEngine {
       );
     }
 
+    if (import.meta.env.DEV) {
+      const context = getAudioContext();
+      const estimatedOutputDelayMs = Math.max(0, scheduledTime - context.currentTime) * 1000 +
+        (context.baseLatency + (context.outputLatency ?? 0)) * 1000;
+      this.lastPlaybackStart = {
+        clipId: clip.id,
+        requestToSourceStartMs: startMeasurement
+          ? sourceStartCallAt - startMeasurement.requestStartedAtMs
+          : 0,
+        audioContextResumeMs: startMeasurement?.resumeDurationMs ?? 0,
+        scheduledLeadMs: Math.max(0, scheduledTime - context.currentTime) * 1000,
+        estimatedOutputDelayMs,
+        estimatedClickToAudibleMs: startMeasurement
+          ? sourceStartCallAt - startMeasurement.requestStartedAtMs + estimatedOutputDelayMs
+          : estimatedOutputDelayMs,
+        sampleRate: buffer.sampleRate,
+      };
+      console.debug("[Audio performance] source.start issued", {
+        ...this.lastPlaybackStart,
+        measuredAt: "AudioBufferSourceNode.start call; output delay is estimated from browser latency reports",
+      });
+    }
+
     this.sources.set(clip.id, source);
     this.sourceMixNodes.set(clip.id, { stem: clip.stem, node: mixNode });
     this.sourceSchedules.set(clip.id, {
@@ -371,6 +676,7 @@ class AudioEngine {
       sourceEnd,
       loop: clip.loopEnabled,
     });
+    this.syncTransport();
 
     source.onended = () => {
       source.disconnect();
@@ -386,17 +692,24 @@ class AudioEngine {
         this.localPlaybackClipIds.delete(clip.id);
         this.pausedLocalOffsets.delete(clip.id);
         this.activeClipIds.delete(clip.id);
+        if (this.sources.size === 0 && this.mode === "arrangement" && this.hasNearFutureActiveClip()) {
+          this.pausedPosition = this.getPosition();
+          this.waitingForAudio = true;
+        }
         this.syncTransport();
       }
     };
   }
 
   private syncTransport() {
-    const playingClipIds = [...this.activeClipIds];
+    // Clip indicators represent real AudioBufferSourceNodes, not merely clips
+    // armed for arrangement playback or waiting on a remote segment download.
+    const playingClipIds = [...this.sources.keys()];
 
     updateTransport({
-      isPlaying: !this.globallyPaused && playingClipIds.length > 0,
-      isPaused: this.globallyPaused && playingClipIds.length > 0,
+      isPlaying: this.sources.size > 0 && !this.globallyPaused,
+      isBuffering: this.mode === "arrangement" && this.activeClipIds.size > 0 && this.sources.size === 0 && !this.globallyPaused,
+      isPaused: this.mode !== null && this.globallyPaused,
       playingClipIds,
       activeClipId: playingClipIds[0] ?? null,
       currentTime: this.getPosition(),
@@ -404,13 +717,14 @@ class AudioEngine {
       duration: this.duration,
     });
 
-    if (playingClipIds.length === 0) {
+    if (this.activeClipIds.size === 0) {
       this.cancelClock();
       this.mode = null;
       this.globallyPaused = false;
 
       updateTransport({
         isPlaying: false,
+        isBuffering: false,
         isPaused: false,
         mode: null,
         activeClipId: null,
@@ -423,8 +737,17 @@ class AudioEngine {
     cancelAnimationFrame(this.animationFrame);
   }
 
+  private hasNearFutureActiveClip(): boolean {
+    const position = this.getPosition();
+    return [...this.activeClipIds].some((clipId) => {
+      const clip = getClipState().clips[clipId];
+      return clip?.active && clip.endTime > position && clip.startTime <= position + 3;
+    });
+  }
+
   private startClock() {
     this.cancelClock();
+    if (import.meta.env.DEV) this.frameMetrics.lastFrameAt = 0;
 
     const generation = this.generation;
 
@@ -432,16 +755,38 @@ class AudioEngine {
       if (generation !== this.generation) return;
       if (this.globallyPaused) return;
 
+      if (import.meta.env.DEV) {
+        const now = performance.now();
+        if (this.frameMetrics.lastFrameAt > 0) {
+          const gap = now - this.frameMetrics.lastFrameAt;
+          this.frameMetrics.maxGapMs = Math.max(this.frameMetrics.maxGapMs, gap);
+          if (gap > 25) this.frameMetrics.droppedFrames += Math.max(1, Math.round(gap / (1000 / 60)) - 1);
+        }
+        this.frameMetrics.lastFrameAt = now;
+        this.frameMetrics.frames++;
+      }
       const position = this.getPosition();
-
-      updateTransport({
-        currentTime: Math.min(position, this.duration),
-        playingClipIds: [...this.activeClipIds],
-      });
+      if (this.mode === "arrangement") {
+        const dueSections = new Set<string>();
+        for (const clipId of this.activeClipIds) {
+          const clip = getClipState().clips[clipId];
+          if (!clip?.active || this.sources.has(clipId) || this.schedulingClipIds.has(clipId)) continue;
+          if (clip.endTime <= position || clip.startTime > position + 3) continue;
+          dueSections.add(clip.sectionId);
+        }
+        for (const sectionId of dueSections) {
+          void this.scheduleSection(sectionId, generation).catch((error) =>
+            console.error("[Audio playback] Synchronized section scheduling failed", { sectionId, error })
+          );
+        }
+      }
+      const hasLoopingSource = [...this.sourceSchedules.values()].some((schedule) => schedule.loop);
+      publishTransportFrame(hasLoopingSource ? position : Math.min(position, this.duration));
 
       if (
         this.mode === "arrangement" &&
-        position >= this.duration
+        position >= this.duration &&
+        !hasLoopingSource
       ) {
         this.stop();
         return;
@@ -451,6 +796,91 @@ class AudioEngine {
     };
 
     this.animationFrame = requestAnimationFrame(tick);
+  }
+
+  /**
+   * Schedule every active stem belonging to one musical section as a group.
+   * A section is never allowed to start one stem while another stem is still
+   * downloading/decoding. All sources share one AudioContext start timestamp
+   * and one master-timeline position.
+   */
+  private async scheduleSection(
+    sectionId: string,
+    generation: number,
+    leadSeconds = 0.05,
+  ): Promise<void> {
+    if (this.schedulingSectionIds.has(sectionId) || generation !== this.generation ||
+      (this.sectionRetryAt.get(sectionId) ?? 0) > performance.now()) return;
+    const clips = Object.values(getClipState().clips).filter((clip) =>
+      clip.active && clip.sectionId === sectionId && this.activeClipIds.has(clip.id) &&
+      !this.sources.has(clip.id)
+    );
+    if (!clips.length) return;
+
+    this.schedulingSectionIds.add(sectionId);
+    try {
+      const results = await Promise.all(clips.map(async (clip) => {
+        try {
+          const buffer = this.getClipBuffer(clip) ?? await this.getClipBufferAsync(clip);
+          return { clip, buffer };
+        } catch (error) {
+          console.error("[Audio playback] Stem section preload failed", {
+            sectionId, stem: clip.stem, clipId: clip.id, error,
+          });
+          return { clip, buffer: null };
+        }
+      }));
+      if (generation !== this.generation || this.globallyPaused || this.mode === null) return;
+
+      const ready = results.filter((item): item is { clip: AudioClip; buffer: AudioBuffer } =>
+        item.buffer !== null && item.clip.active
+      );
+      // Never start a partial stem group: one missing decode would recreate
+      // the exact audible phase drift this barrier is meant to prevent.
+      if (!ready.length || ready.length !== clips.length) {
+        const attempts = (this.sectionRetryCount.get(sectionId) ?? 0) + 1;
+        this.sectionRetryCount.set(sectionId, attempts);
+        const retryDelayMs = Math.min(15_000, 500 * 2 ** Math.min(attempts - 1, 5));
+        this.sectionRetryAt.set(sectionId, performance.now() + retryDelayMs);
+        if (this.sources.size === 0 && this.mode === "arrangement") {
+          this.pausedPosition = this.getPosition();
+          this.waitingForAudio = true;
+        }
+        console.error("[Audio playback] Synchronized section unavailable; retry scheduled", {
+          sectionId, attempts, retryDelayMs, failedStems: results.filter((item) => !item.buffer).map(({ clip }) => clip.stem),
+        });
+        return;
+      }
+
+      // One snapshot for the entire section group: never let each stem use
+      // its own fetch-completion time as a new timeline origin.
+      const context = getAudioContext();
+      const sharedTimelinePosition = this.getPosition();
+      if (this.waitingForAudio && this.mode === "arrangement") this.beginTimeline(sharedTimelinePosition);
+      this.waitingForAudio = false;
+      const sharedStartAt = context.currentTime + leadSeconds;
+      await Promise.all(ready.map(({ clip }) => this.scheduleClip(
+        clip,
+        sharedTimelinePosition,
+        sharedStartAt,
+        generation,
+        "timeline",
+      )));
+      if (import.meta.env.DEV) {
+        console.debug("[Audio sync] section group scheduled", {
+          sectionId,
+          timelinePosition: sharedTimelinePosition,
+          audioContextStartAt: sharedStartAt,
+          stems: ready.map(({ clip }) => clip.stem),
+          sourceCount: ready.length,
+        });
+      }
+      this.sectionRetryAt.delete(sectionId);
+      this.sectionRetryCount.delete(sectionId);
+    } finally {
+      this.schedulingSectionIds.delete(sectionId);
+      this.syncTransport();
+    }
   }
 
   private stopSource(clipId: string) {
@@ -488,9 +918,11 @@ class AudioEngine {
     this.pausedPosition = position;
     this.contextStart = context.currentTime + 0.03;
     this.globallyPaused = false;
+    this.waitingForAudio = false;
   }
 
   async playClip(clipId: string) {
+    const requestStartedAtMs = performance.now();
     let clip = getClipState().clips[clipId];
 
     if (!clip?.active) return;
@@ -499,24 +931,39 @@ class AudioEngine {
     if (this.activeClipIds.has(clipId)) return;
 
     const requestTime = getAudioContext().currentTime;
-    const context = await resumeAudioContext();
+    const generation = this.generation;
+    const requestId = ++this.requestSequence;
+    this.pendingClipRequests.set(clipId, requestId);
+    let context: AudioContext;
+    const resumeStartedAtMs = performance.now();
+    let resumeDurationMs: number;
+    try {
+      context = await resumeAudioContext();
+      resumeDurationMs = performance.now() - resumeStartedAtMs;
+    } catch (error) {
+      if (this.pendingClipRequests.get(clipId) === requestId) this.pendingClipRequests.delete(clipId);
+      throw error;
+    }
 
-    // AudioContext resume is asynchronous. Re-read the clip and buffer after
-    // it completes so scheduling uses current project state and source range.
+    // A new project, stop, seek, or newer click invalidates this asynchronous
+    // request. A late AudioContext.resume() must never revive a replaced track.
+    if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
+
+    // AudioContext resume is asynchronous. Re-read the clip and lazily fetch
+    // server-owned segment audio before deciding whether playback can start.
     clip = getClipState().clips[clipId];
     if (!clip?.active) return;
-    if (!this.getClipBuffer(clip)) {
-      if (import.meta.env.DEV) {
-        console.warn("[Audio timing] play request has no prepared buffer", {
-          clipId,
-          stem: clip.stem,
-          sectionId: clip.sectionId,
-          requestContextTime: requestTime,
-          contextTimeAfterResume: context.currentTime,
-        });
-      }
+    try {
+      if (!this.getClipBuffer(clip)) await this.getClipBufferAsync(clip);
+    } catch (error) {
+      if (import.meta.env.DEV) console.error("[Audio timing] segment load failed", { clipId, error });
+      if (this.pendingClipRequests.get(clipId) === requestId) this.pendingClipRequests.delete(clipId);
       return;
     }
+    if (generation !== this.generation || this.pendingClipRequests.get(clipId) !== requestId) return;
+    this.pendingClipRequests.delete(clipId);
+    clip = getClipState().clips[clipId];
+    if (!clip?.active || !this.getClipBuffer(clip)) return;
 
     const hadTransport = this.mode !== null;
     if (this.mode === null) {
@@ -535,8 +982,10 @@ class AudioEngine {
       ? position
       : this.timelineStart + Math.max(0, scheduleAt - this.contextStart);
     const pausedOffset = this.pausedLocalOffsets.get(clipId);
+    // Manual playback must replay a clip when the shared playhead has
+    // already passed its end. Timeline mapping would point beyond sourceEnd.
     const scheduleMode = pausedOffset !== undefined ||
-      (hadTransport && targetPosition < clip.startTime)
+      (hadTransport && (targetPosition < clip.startTime || targetPosition >= clip.endTime))
       ? "clip-local"
       : "timeline";
     if (scheduleMode === "clip-local") this.localPlaybackClipIds.add(clipId);
@@ -572,6 +1021,7 @@ class AudioEngine {
       this.generation,
       scheduleMode,
       pausedOffset,
+      { requestStartedAtMs, resumeDurationMs },
     );
     this.pausedLocalOffsets.delete(clipId);
 
@@ -580,6 +1030,7 @@ class AudioEngine {
   }
 
   pauseClip(clipId: string) {
+    this.pendingClipRequests.delete(clipId);
     if (!this.activeClipIds.has(clipId)) return;
 
     if (this.localPlaybackClipIds.has(clipId)) {
@@ -610,7 +1061,9 @@ class AudioEngine {
 
     if (!clips.length) return;
 
+    const requestGeneration = this.generation;
     await resumeAudioContext();
+    if (requestGeneration !== this.generation) return;
 
     this.stop();
     this.localPlaybackClipIds.clear();
@@ -623,29 +1076,35 @@ class AudioEngine {
       fromTime = 0;
     }
 
+    const playbackGeneration = this.generation;
+    // Load every stem needed at the initial playhead BEFORE starting the
+    // transport clock. This gives all four sources one shared future start.
+    const initialWindowEnd = fromTime + 3;
+    const initialClips = clips.filter((clip) =>
+      clip.endTime > fromTime && clip.startTime <= initialWindowEnd
+    );
+    await Promise.all(initialClips.map(async (clip) => {
+      try {
+        await this.getClipBufferAsync(clip);
+      } catch (error) {
+        console.error("[Audio playback] Initial arrangement segment failed to load", {
+          clipId: clip.id, stem: clip.stem, error,
+        });
+      }
+    }));
+    if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
+
+    // Start the global clock only after initial stem buffers are ready.
     this.beginTimeline(fromTime);
+    for (const clip of clips) this.activeClipIds.add(clip.id);
 
-    for (const clip of clips) {
-      this.activeClipIds.add(clip.id);
-    }
-
-
-    for (const clip of clips) {
-      this.scheduleClip(
-        clip,
-        fromTime,
-        this.contextStart,
-        this.generation,
-      );
-    }
-
+    const initialSectionIds = [...new Set(initialClips.map((clip) => clip.sectionId))];
+    await Promise.all(initialSectionIds.map((sectionId) =>
+      this.scheduleSection(sectionId, playbackGeneration, Math.max(0.05, this.contextStart - getAudioContext().currentTime))
+    ));
+    if (playbackGeneration !== this.generation || this.mode !== "arrangement") return;
     this.syncTransport();
-
-    if (this.sources.size > 0) {
-      this.startClock();
-    } else {
-      this.stop();
-    }
+    this.startClock();
   }
 
   pause() {
@@ -664,6 +1123,7 @@ class AudioEngine {
 
     updateTransport({
       isPlaying: false,
+      isBuffering: false,
       isPaused: true,
       currentTime: this.pausedPosition,
       playingClipIds: [...this.activeClipIds],
@@ -673,33 +1133,46 @@ class AudioEngine {
   async resume() {
     if (this.mode === null || !this.globallyPaused) return;
 
+    const generationBeforeResume = this.generation;
+    await resumeAudioContext();
+    if (generationBeforeResume !== this.generation || this.mode === null || !this.globallyPaused) return;
 
     this.globallyPaused = false;
+    this.waitingForAudio = false;
     this.beginTimeline(this.pausedPosition);
 
     const generation = this.generation;
-
-    for (const clipId of this.activeClipIds) {
-      const clip = getClipState().clips[clipId];
-
-      if (!clip?.active) {
-        this.activeClipIds.delete(clipId);
-        continue;
+    if (this.mode === "arrangement") {
+      const dueSections = new Set<string>();
+      for (const clipId of this.activeClipIds) {
+        const clip = getClipState().clips[clipId];
+        if (!clip?.active) this.activeClipIds.delete(clipId);
+        else if (clip.endTime > this.pausedPosition && clip.startTime <= this.pausedPosition + 3) {
+          dueSections.add(clip.sectionId);
+        }
       }
-
-      this.scheduleClip(
-        clip,
-        this.pausedPosition,
-        this.contextStart,
-        generation,
-        this.localPlaybackClipIds.has(clipId) ? "clip-local" : "timeline",
-        this.pausedLocalOffsets.get(clipId),
-      );
+      await Promise.all([...dueSections].map((sectionId) => this.scheduleSection(sectionId, generation)));
+    } else {
+      for (const clipId of this.activeClipIds) {
+        const clip = getClipState().clips[clipId];
+        if (!clip?.active) {
+          this.activeClipIds.delete(clipId);
+          continue;
+        }
+        this.scheduleClip(
+          clip,
+          this.pausedPosition,
+          this.contextStart,
+          generation,
+          this.localPlaybackClipIds.has(clipId) ? "clip-local" : "timeline",
+          this.pausedLocalOffsets.get(clipId),
+        );
+      }
     }
 
     this.syncTransport();
 
-    if (this.sources.size > 0) {
+    if (this.sources.size > 0 || this.mode === "arrangement") {
       this.startClock();
     }
   }
@@ -733,23 +1206,29 @@ class AudioEngine {
     this.beginTimeline(nextPosition);
 
     const generation = this.generation;
-    for (const clipId of this.activeClipIds) {
-      const clip = getClipState().clips[clipId];
-      if (!clip?.active) {
-        this.activeClipIds.delete(clipId);
-        continue;
+    if (this.mode === "arrangement") {
+      const dueSections = new Set<string>();
+      for (const clipId of this.activeClipIds) {
+        const clip = getClipState().clips[clipId];
+        if (!clip?.active) this.activeClipIds.delete(clipId);
+        else if (clip.endTime > nextPosition && clip.startTime <= nextPosition + 3) {
+          dueSections.add(clip.sectionId);
+        }
       }
-
-      this.scheduleClip(
-        clip,
-        nextPosition,
-        this.contextStart,
-        generation,
-      );
+      for (const sectionId of dueSections) {
+        void this.scheduleSection(sectionId, generation).catch((error) =>
+          console.error("[Audio playback] Seek section scheduling failed", { sectionId, error }));
+      }
+    } else {
+      for (const clipId of this.activeClipIds) {
+        const clip = getClipState().clips[clipId];
+        if (!clip?.active) this.activeClipIds.delete(clipId);
+        else this.scheduleClip(clip, nextPosition, this.contextStart, generation);
+      }
     }
 
     this.syncTransport();
-    if (this.sources.size > 0) this.startClock();
+    if (this.sources.size > 0 || this.mode === "arrangement") this.startClock();
   }
 
   async togglePlayback() {
@@ -759,6 +1238,8 @@ class AudioEngine {
       this.pause();
     } else if (transport.isPaused) {
       await this.resume();
+    } else if (transport.mode !== null) {
+      this.pause();
     } else {
       await this.playArrangement(0);
     }
@@ -766,6 +1247,7 @@ class AudioEngine {
 
   stop() {
     this.generation++;
+    this.pendingClipRequests.clear();
     this.cancelClock();
     this.stopAllSources();
     this.localPlaybackClipIds.clear();
@@ -779,6 +1261,9 @@ class AudioEngine {
     this.pausedPosition = 0;
     this.duration = 0;
     this.globallyPaused = false;
+    this.waitingForAudio = false;
+    this.sectionRetryAt.clear();
+    this.sectionRetryCount.clear();
 
     resetTransport();
   }

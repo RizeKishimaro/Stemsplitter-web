@@ -1,8 +1,14 @@
 
 
-import type { CSSProperties, MouseEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 
-import { useProjectStore } from "../../../stores/project.store";
+import {
+  setTimelineMarkerPosition,
+  type BeatSnapMode,
+  type TimelineMarkerKind,
+  useProjectStore,
+  useProjectStoreSelector,
+} from "../../../stores/project.store";
 import { audioEngine } from "../../audio-engine/AudioEngine";
 
 import {
@@ -17,11 +23,13 @@ import {
 
 import {
   useTransportStore,
+  registerTransportFrameRenderer,
   type TransportState,
 } from "../../../stores/transport.store";
 
 import type { TrackType } from "./TrackHeader";
 import type { StemName } from "../../stem-separation/chunkEngine";
+import { markArrangementRender } from "./arrangementMetrics";
 
 import "./ArrangementGrid.css";
 
@@ -39,23 +47,35 @@ const TRACK_LABELS: Record<TrackType, string> = {
   vocals: "VOCALS",
 };
 
+const waveformCache = new WeakMap<Float32Array, Map<string, string>>();
+
 function getWaveformPath(
   channel: Float32Array,
   width = 180,
   height = 44,
   samples = 90,
+  rangeStart = 0,
+  rangeEnd = channel.length,
 ): string {
-  if (!channel.length) return "";
+  if (!channel.length || rangeEnd <= rangeStart) return "";
+  const cacheKey = `${width}:${height}:${samples}:${rangeStart}:${rangeEnd}`;
+  let paths = waveformCache.get(channel);
+  if (!paths) {
+    paths = new Map();
+    waveformCache.set(channel, paths);
+  }
+  const cached = paths.get(cacheKey);
+  if (cached) return cached;
 
   const center = height / 2;
-  const step = channel.length / samples;
+  const step = (rangeEnd - rangeStart) / samples;
   const points: string[] = [];
 
   for (let i = 0; i < samples; i++) {
-    const start = Math.floor(i * step);
+    const start = rangeStart + Math.floor(i * step);
     const end = Math.min(
-      channel.length,
-      Math.max(start + 1, Math.floor((i + 1) * step)),
+      rangeEnd,
+      Math.max(start + 1, rangeStart + Math.floor((i + 1) * step)),
     );
 
     let peak = 0;
@@ -73,7 +93,9 @@ function getWaveformPath(
     );
   }
 
-  return points.join(" ");
+  const path = points.join(" ");
+  paths.set(cacheKey, path);
+  return path;
 }
 
 /**
@@ -203,37 +225,57 @@ function ClipControls({
  *
  * The position always comes from the shared global transport clock.
  */
-function getClipPlayhead(
-  clip: AudioClip,
-  transport: TransportState,
-): number | null {
-  const isInPlaybackSession =
-    transport.playingClipIds.includes(clip.id);
-
-  if (!isInPlaybackSession) return null;
-
-  if (!transport.isPlaying && !transport.isPaused) {
-    return null;
-  }
-
+function ClipPlayhead({ clip, transport }: { clip: AudioClip; transport: TransportState }) {
+  const element = useRef<HTMLDivElement>(null);
+  const isInPlaybackSession = transport.playingClipIds.includes(clip.id);
   const clipDuration = clip.endTime - clip.startTime;
+  const visible = isInPlaybackSession &&
+    (transport.isPlaying || transport.isPaused) && clipDuration > 0;
 
-  if (clipDuration <= 0) return null;
+  useEffect(() => {
+    if (!visible) return;
+    const renderPosition = (position: number) => {
+      const playhead = element.current;
+      if (!playhead) return;
+      const elapsed = position - clip.startTime;
+      const inClip = elapsed >= 0 && (clip.loopEnabled || elapsed <= clipDuration);
+      if (!inClip) {
+        playhead.style.opacity = "0";
+        return;
+      }
+      const progress = clip.loopEnabled
+        ? (elapsed % clipDuration) / clipDuration
+        : Math.min(1, elapsed / clipDuration);
+      playhead.style.opacity = "1";
+      const width = playhead.parentElement?.clientWidth ?? 0;
+      playhead.style.transform = `translate3d(${progress * width}px, 0, 0)`;
+    };
+    const unregister = registerTransportFrameRenderer(renderPosition);
+    return () => { unregister(); };
+  }, [clip.startTime, clipDuration, clip.loopEnabled, visible]);
 
-  const elapsed = transport.currentTime - clip.startTime;
+  return visible
+    ? <div ref={element} className="arrangement-clip__playhead" />
+    : null;
+}
 
-  // The clip has not started yet.
-  if (elapsed < 0) return null;
-
-  // Looping clips wrap their visual playhead.
-  if (clip.loopEnabled) {
-    return (elapsed % clipDuration) / clipDuration;
-  }
-
-  // Non-looping clips stop showing the playhead after their end.
-  if (elapsed > clipDuration) return null;
-
-  return Math.min(1, elapsed / clipDuration);
+function getWaveformPathFromPeaks(
+  peaks: number[],
+  width = 180,
+  height = 44,
+): string {
+  if (!peaks.length) return "";
+  const center = height / 2;
+  const points: string[] = [];
+  peaks.forEach((peak, index) => {
+    const x = (index / peaks.length) * width;
+    const amplitude = Math.max(1, Math.min(1, peak) * center * 0.9);
+    points.push(
+      `M ${x.toFixed(2)} ${(center - amplitude).toFixed(2)}`,
+      `L ${x.toFixed(2)} ${(center + amplitude).toFixed(2)}`,
+    );
+  });
+  return points.join(" ");
 }
 
 /**
@@ -244,24 +286,56 @@ function SectionClip({
   sectionStart,
   sectionEnd,
   channels,
+  sectionId,
   transport,
 }: {
   clip: AudioClip;
   sectionStart: number;
   sectionEnd: number;
-  channels: Float32Array[];
+  channels?: Float32Array[];
+  sectionId: string;
   transport: TransportState;
 }) {
-  const channel = channels[0];
+  const channel = channels?.[0];
+  const [serverPeaks, setServerPeaks] = useState<number[] | null>(null);
+  const clipElement = useRef<HTMLDivElement>(null);
 
-  if (!channel) return null;
+  useEffect(() => {
+    if (channel || serverPeaks) return;
+    const element = clipElement.current;
+    if (!element) return;
+    let cancelled = false;
+    let requested = false;
+    const load = () => {
+      if (requested || cancelled) return;
+      requested = true;
+      void audioEngine.getServerWaveformPeaks(sectionId, clip.stem, 90)
+        .then((peaks) => { if (!cancelled && peaks) setServerPeaks(peaks); })
+        .catch((error) => console.warn("[Waveform] Could not load server segment peaks", {
+          sectionId, stem: clip.stem, error,
+        }));
+    };
+    if (typeof IntersectionObserver === "undefined") {
+      load();
+      return () => { cancelled = true; };
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        load();
+        observer.disconnect();
+      }
+    }, { rootMargin: "160px 240px" });
+    observer.observe(element);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [channel, clip.stem, sectionId, serverPeaks]);
 
-  const clipAudio = channel.subarray(
-    clip.sourceStartSample,
-    clip.sourceEndSample,
-  );
-
-  const path = getWaveformPath(clipAudio);
+  const path = channel
+    ? getWaveformPath(channel, 180, 44, 90, clip.sourceStartSample, clip.sourceEndSample)
+    : getWaveformPathFromPeaks(serverPeaks ?? []);
+  const hasWaveform = Boolean(channel || serverPeaks?.length);
 
   const sectionDuration = sectionEnd - sectionStart;
 
@@ -273,14 +347,10 @@ function SectionClip({
   const widthPercent =
     ((clip.endTime - clip.startTime) / sectionDuration) * 100;
 
-  const playheadProgress = getClipPlayhead(
-    clip,
-    transport,
-  );
-
   return (
     <div
-      className={`arrangement-clip arrangement-clip--${clip.stem} ${clip.parentClipId
+      ref={clipElement}
+      className={`arrangement-clip arrangement-clip--${clip.stem} ${hasWaveform ? "" : "arrangement-clip--loading"} ${clip.parentClipId
           ? "arrangement-clip--split"
           : ""
         }`}
@@ -292,23 +362,16 @@ function SectionClip({
       }}
       title={`${clip.stem.toUpperCase()} · ${clip.startTime.toFixed(2)}s–${clip.endTime.toFixed(2)}s`}
     >
-      {playheadProgress !== null && (
-        <div
-          className="arrangement-clip__playhead"
-          style={{
-            left: `${playheadProgress * 100}%`,
-          }}
-        />
-      )}
+      <ClipPlayhead clip={clip} transport={transport} />
 
-      <svg
+      {hasWaveform ? <svg
         className="arrangement-clip__waveform"
         viewBox="0 0 180 44"
         preserveAspectRatio="none"
         aria-hidden="true"
       >
         <path d={path} />
-      </svg>
+      </svg> : <span className="arrangement-clip__loading-wave" aria-label="Loading waveform" />}
 
       <span className="arrangement-clip__label">
         {clip.splitDepth > 0
@@ -324,6 +387,94 @@ function SectionClip({
   );
 }
 
+function BeatMarkers({
+  startSample,
+  endSample,
+  sampleRate,
+  beats,
+  downbeats,
+  snapMode,
+  snapTargets,
+}: {
+  startSample: number;
+  endSample: number;
+  sampleRate: number;
+  beats: Array<{ original: number; sample: number }>;
+  downbeats: Array<{ original: number; sample: number; bar: number }>;
+  snapMode: BeatSnapMode;
+  snapTargets: number[];
+}) {
+  const duration = endSample - startSample;
+  if (duration <= 0 || sampleRate <= 0) return null;
+
+  const renderMarker = (
+    kind: TimelineMarkerKind,
+    originalSample: number,
+    sample: number,
+    label?: string,
+  ) => {
+    if (sample < startSample || sample >= endSample) return null;
+    const leftPercent = ((sample - startSample) / duration) * 100;
+    const time = (pointerX: number, row: HTMLElement) => {
+      const bounds = row.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (pointerX - bounds.left) / bounds.width));
+      const target = Math.round(startSample + ratio * duration);
+      const snappedTarget = snapMode === "off" || !snapTargets.length
+        ? target
+        : snapTargets.reduce((closest, candidate) =>
+            Math.abs(candidate - target) < Math.abs(closest - target) ? candidate : closest,
+          snapTargets[0]);
+      setTimelineMarkerPosition(
+        kind,
+        originalSample,
+        Math.max(startSample, Math.min(endSample - 1, snappedTarget)),
+      );
+    };
+    return (
+      <button
+        key={`${kind}:${originalSample}`}
+        type="button"
+        className={`timeline-marker timeline-marker--${kind}`}
+        style={{ left: `${leftPercent}%` }}
+        role="slider"
+        aria-label={label ? `Bar ${label} downbeat marker` : "Beat marker"}
+        aria-valuemin={startSample}
+        aria-valuemax={endSample}
+        aria-valuenow={sample}
+        title={label ? `Bar ${label} · drag to adjust` : `Beat · drag to adjust`}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (event.buttons !== 1) return;
+          const row = event.currentTarget.closest(".arrangement-row");
+          if (row instanceof HTMLElement) time(event.clientX, row);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const step = event.shiftKey ? sampleRate : Math.max(1, Math.round(sampleRate / 100));
+          setTimelineMarkerPosition(
+            kind,
+            originalSample,
+            Math.max(startSample, Math.min(endSample - 1, sample + (event.key === "ArrowRight" ? step : -step))),
+          );
+        }}
+      >
+        {label && <span className="timeline-marker__label">{label}</span>}
+      </button>
+    );
+  };
+
+  return (
+    <div className="timeline-markers" aria-label="Master beat grid">
+      {beats.map((beat) => renderMarker("beat", beat.original, beat.sample))}
+      {downbeats.map((beat) => renderMarker("downbeat", beat.original, beat.sample, String(beat.bar)))}
+    </div>
+  );
+}
+
 /**
  * One arrangement column.
  */
@@ -334,6 +485,14 @@ function TrackColumn({
   selectedClipId,
   transport,
   rowCount,
+  sectionRowById,
+  beats,
+  downbeats,
+  sampleRate,
+  snapMode,
+  snapTargets,
+  processing,
+  processingProgress,
 }: {
   type: TrackType;
   clips: AudioClip[];
@@ -341,6 +500,14 @@ function TrackColumn({
   selectedClipId: string | null;
   transport: TransportState;
   rowCount: number;
+  sectionRowById: Map<string, number>;
+  beats: Array<{ original: number; sample: number }>;
+  downbeats: Array<{ original: number; sample: number; bar: number }>;
+  sampleRate: number;
+  snapMode: BeatSnapMode;
+  snapTargets: number[];
+  processing: boolean;
+  processingProgress: number | null;
 }) {
   const stem = type as StemName;
 
@@ -351,7 +518,8 @@ function TrackColumn({
 
     if (!section) continue;
 
-    const row = section.index + 1;
+    const row = sectionRowById.get(clip.sectionId);
+    if (row === undefined) continue;
     const rowClips = clipsByRow.get(row) ?? [];
 
     rowClips.push(clip);
@@ -374,6 +542,18 @@ function TrackColumn({
               className="arrangement-row"
               key={row}
             >
+              {processing && row === 1 && rowClips.length === 0 && (
+                <div
+                  className={`arrangement-processing-clip arrangement-processing-clip--${type}`}
+                  aria-label={`${TRACK_LABELS[type]} stem processing`}
+                  data-testid={`processing-track-${type}`}
+                >
+                  {processingProgress !== null && (
+                    <span style={{ width: `${processingProgress}%` }} />
+                  )}
+                </div>
+              )}
+              {projectMarkerSection(sections, clipsByRow, row, beats, downbeats, sampleRate, snapMode, snapTargets)}
               {rowClips.map((clip) => {
                 const section = sections[clip.sectionId];
 
@@ -393,6 +573,7 @@ function TrackColumn({
                       sectionStart={section.startTime}
                       sectionEnd={section.endTime}
                       channels={section.stems[stem]}
+                      sectionId={section.id}
                       transport={transport}
                     />
                   </div>
@@ -406,11 +587,51 @@ function TrackColumn({
   );
 }
 
+function projectMarkerSection(
+  sections: ReturnType<typeof useProjectStore>["completedSections"],
+  clipsByRow: Map<number, AudioClip[]>,
+  row: number,
+  beats: Array<{ original: number; sample: number }>,
+  downbeats: Array<{ original: number; sample: number; bar: number }>,
+  sampleRate: number,
+  snapMode: BeatSnapMode,
+  snapTargets: number[],
+) {
+  const clip = clipsByRow.get(row)?.[0];
+  const section = clip ? sections[clip.sectionId] : null;
+  if (!section) return null;
+  return (
+    <BeatMarkers
+      startSample={section.startSample}
+      endSample={section.endSample}
+      sampleRate={sampleRate}
+      beats={beats}
+      downbeats={downbeats}
+      snapMode={snapMode}
+      snapTargets={snapTargets}
+    />
+  );
+}
+
 /**
  * Main arrangement grid.
  */
-export function ArrangementGrid() {
-  const project = useProjectStore();
+export function ArrangementGrid({
+  processingProgress,
+}: {
+  processingProgress: number | null;
+}) {
+  markArrangementRender();
+  const project = useProjectStoreSelector((state) => ({
+    sections: state.sections,
+    completedSections: state.completedSections,
+    masterTimeline: state.masterTimeline,
+    beatMarkerGrid: state.beatMarkerGrid,
+    timelineCorrections: state.timelineCorrections,
+    downbeatPhaseOffsetSamples: state.downbeatPhaseOffsetSamples,
+    beatSnapMode: state.beatSnapMode,
+    status: state.status,
+  }));
   const clipState = useClipStore();
   const transport = useTransportStore();
 
@@ -418,11 +639,42 @@ export function ArrangementGrid() {
     clipState.clips,
   ).filter(clip => clip.active);
 
-  const rowCount = Math.max(
-    9,
-    project.sections.length,
-    Object.keys(project.completedSections).length,
+  const timeline = project.masterTimeline;
+  const markerGrid = project.beatMarkerGrid ?? (timeline ? {
+    sampleRate: timeline.sampleRate,
+    beatSamples: timeline.beatSamples,
+    downbeatSamples: timeline.downbeatSamples,
+  } : null);
+  const beats = markerGrid?.beatSamples.map((original) => ({
+    original,
+    sample: project.timelineCorrections[`beat:${original}`] ?? original,
+  })) ?? [];
+  const downbeats = markerGrid?.downbeatSamples.map((original, index) => ({
+    original,
+    sample: project.timelineCorrections[`downbeat:${original}`]
+      ?? original + project.downbeatPhaseOffsetSamples,
+    bar: index + 1,
+  })) ?? [];
+  const snapTargets = project.beatSnapMode === "bar"
+    ? downbeats.map((beat) => beat.sample)
+    : beats.map((beat) => beat.sample);
+  const renderedSections = Object.fromEntries(project.sections.map((section) => [section.id, project.completedSections[section.id] ?? {
+    ...section,
+    sampleRate: markerGrid?.sampleRate ?? timeline?.sampleRate ?? 0,
+    stems: { drums: [], bass: [], other: [], vocals: [] },
+  }])) as typeof project.completedSections;
+
+  // Timeline section indexes are musical bar positions (for example 1, 5, 9),
+  // not visual row numbers. Build compact rows from the actual active sections.
+  const orderedSectionIds = [...new Set(activeClips.map((clip) => clip.sectionId))]
+    .filter((sectionId) => Boolean(renderedSections[sectionId]))
+    .sort((a, b) =>
+      renderedSections[a].startTime - renderedSections[b].startTime
+    );
+  const sectionRowById = new Map(
+    orderedSectionIds.map((sectionId, index) => [sectionId, index + 1]),
   );
+  const rowCount = Math.max(1, orderedSectionIds.length);
 
   return (
     <section
@@ -454,10 +706,18 @@ export function ArrangementGrid() {
             clips={activeClips.filter(
               clip => clip.stem === track,
             )}
-            sections={project.completedSections}
+            sections={renderedSections}
             selectedClipId={clipState.selectedClipId}
             transport={transport}
             rowCount={rowCount}
+            sectionRowById={sectionRowById}
+            beats={beats}
+            downbeats={downbeats}
+            sampleRate={markerGrid?.sampleRate ?? 0}
+            snapMode={project.beatSnapMode}
+            snapTargets={snapTargets}
+            processing={project.status === "separating"}
+            processingProgress={processingProgress}
           />
         ))}
       </div>

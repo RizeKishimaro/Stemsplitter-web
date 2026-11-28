@@ -1,8 +1,9 @@
 
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 import type { AnalysisResult } from "../features/audio-analysis/analysisClient";
+import type { BeatAnalysisResult } from "../features/beat-analysis/beatAnalysisClient";
 import type {
   SeparationSection,
   StemName,
@@ -23,7 +24,7 @@ export type ProjectStatus =
 export type MasterTimeline = {
   originSample: 0;
   sampleRate: number;
-  bpm: number;
+  bpm: number | null;
   meter: number;
   beatSamples: number[];
   downbeatSamples: number[];
@@ -34,12 +35,34 @@ export type MasterTimeline = {
   }>;
 };
 
+export type BeatSnapMode = "off" | "beat" | "bar";
+export type ArrangementSegmentSize = "1bar" | "2bars" | "4bars" | "beat";
+
+export type BeatMarkerGrid = {
+  sampleRate: number;
+  bpm: number | null;
+  beatSamples: number[];
+  downbeatSamples: number[];
+  engine: string;
+  engineVersion: string;
+  modelVersion: string | null;
+  inputStem: string;
+};
+
 export type ProjectState = {
   file: File | null;
   audio: AudioBuffer | null;
+  backendProjectId: string | null;
+  serverSaveStatus: "idle" | "saving" | "saved" | "error";
 
   analysis: AnalysisResult | null;
   masterTimeline: MasterTimeline | null;
+  beatMarkerGrid: BeatMarkerGrid | null;
+  /** Manual marker adjustments remain separate from detector output. */
+  timelineCorrections: Record<string, number>;
+  beatSnapMode: BeatSnapMode;
+  downbeatPhaseOffsetSamples: number;
+  segmentSize: ArrangementSegmentSize;
   sections: SeparationSection[];
 
   completedSections: Record<string, SeparatedSection>;
@@ -53,8 +76,15 @@ export type ProjectState = {
 const initialState: ProjectState = {
   file: null,
   audio: null,
+  backendProjectId: null,
+  serverSaveStatus: "idle",
   analysis: null,
   masterTimeline: null,
+  beatMarkerGrid: null,
+  timelineCorrections: {},
+  beatSnapMode: "off",
+  downbeatPhaseOffsetSamples: 0,
+  segmentSize: "4bars",
   sections: [],
   completedSections: {},
   sectionProgress: {},
@@ -97,8 +127,32 @@ export function useProjectStore() {
   );
 }
 
+function shallowEqual(a: unknown, b: unknown) {
+  if (Object.is(a, b)) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord);
+  return aKeys.length === Object.keys(bRecord).length &&
+    aKeys.every((key) => Object.is(aRecord[key], bRecord[key]));
+}
+
+/** Subscribe to a stable projection so unrelated progress events do not rerender a screen. */
+export function useProjectStoreSelector<T>(selector: (value: ProjectState) => T): T {
+  const [selected, setSelected] = useState(() => selector(state));
+  useEffect(() => {
+    const refresh = () => setSelected((previous) => {
+      const next = selector(state);
+      return shallowEqual(previous, next) ? previous : next;
+    });
+    refresh();
+    return subscribeProject(refresh);
+  }, [selector]);
+  return selected;
+}
+
 // Import original audio.
-export function setImportedAudio(file: File, audio: AudioBuffer) {
+export function setImportedAudio(file: File, audio: AudioBuffer | null = null) {
   state = {
     ...initialState,
     file,
@@ -106,6 +160,40 @@ export function setImportedAudio(file: File, audio: AudioBuffer) {
     status: "imported",
   };
 
+  emit();
+}
+
+export function setBackendProjectId(backendProjectId: string | null) {
+  if (typeof localStorage !== "undefined") {
+    try {
+      if (backendProjectId) localStorage.setItem("dubpad:last-server-project", backendProjectId);
+      else localStorage.removeItem("dubpad:last-server-project");
+    } catch { /* Server remains authoritative when browser storage is unavailable. */ }
+  }
+  updateState({ backendProjectId, serverSaveStatus: "idle" });
+}
+
+export function setServerSaveStatus(serverSaveStatus: ProjectState["serverSaveStatus"]) {
+  updateState({ serverSaveStatus });
+}
+
+export function restoreProjectSnapshot(
+  file: File,
+  audio: AudioBuffer | null,
+  saved: Omit<ProjectState, "file" | "audio" | "completedSections" | "sectionProgress" | "sectionErrors" | "error">,
+  completedSections: SeparatedSection[],
+) {
+  const completedById = Object.fromEntries(completedSections.map((section) => [section.id, section]));
+  state = {
+    ...initialState,
+    ...saved,
+    file,
+    audio,
+    completedSections: completedById,
+    sectionProgress: Object.fromEntries(saved.sections.map((section) => [section.id, completedById[section.id] ? 100 : 0])),
+    sectionErrors: {},
+    error: null,
+  };
   emit();
 }
 
@@ -119,6 +207,198 @@ export function setAnalysisResult(analysis: AnalysisResult) {
     analysis,
     status: "ready",
     error: null,
+  });
+}
+
+export type TimelineMarkerKind = "beat" | "downbeat";
+
+export function setTimelineMarkerPosition(
+  kind: TimelineMarkerKind,
+  detectedSample: number,
+  correctedSample: number,
+) {
+  if (!Number.isSafeInteger(detectedSample) || !Number.isSafeInteger(correctedSample)) return;
+  const key = `${kind}:${detectedSample}`;
+  updateState({
+    timelineCorrections: {
+      ...state.timelineCorrections,
+      [key]: correctedSample,
+    },
+  });
+}
+
+export function getTimelineMarkerSample(
+  kind: TimelineMarkerKind,
+  detectedSample: number,
+) {
+  return state.timelineCorrections[`${kind}:${detectedSample}`] ?? detectedSample;
+}
+
+export function setBeatSnapMode(beatSnapMode: BeatSnapMode) {
+  updateState({ beatSnapMode });
+}
+
+export function setDownbeatPhaseOffsetSamples(downbeatPhaseOffsetSamples: number) {
+  if (!Number.isSafeInteger(downbeatPhaseOffsetSamples)) return;
+  updateState({ downbeatPhaseOffsetSamples });
+}
+
+/** Import backend detector timestamps while keeping the arrangement grid untouched. */
+export function setExternalBeatMarkerGrid(result: BeatAnalysisResult, sourceSampleRate?: number) {
+  const sampleRate = state.masterTimeline?.sampleRate ?? sourceSampleRate;
+  if (!sampleRate) throw new Error("Import audio before applying backend beat analysis.");
+  updateState({
+    beatMarkerGrid: {
+      sampleRate,
+      bpm: result.bpm,
+      beatSamples: result.beats.map((beat) => Math.round(beat.time_seconds * sampleRate)),
+      downbeatSamples: result.downbeats.map((beat) => Math.round(beat.time_seconds * sampleRate)),
+      engine: result.detection_engine,
+      engineVersion: result.engine_version,
+      modelVersion: result.model_version,
+      inputStem: result.input_stem,
+    },
+  });
+}
+
+/** Apply the persisted backend beat grid without converting frame positions through seconds. */
+export function setBackendBeatTimeline(
+  grid: {
+    audio: { sampleRate: number; frames: number };
+    analysis: {
+      bpm: number | null;
+      beatsPerBar: number;
+      engine: string;
+      engineVersion: string | null;
+      modelVersion: string | null;
+      inputStem: string;
+      beats: Array<{ samplePosition: number }>;
+      downbeats: Array<{ samplePosition: number }>;
+    };
+  },
+  sections: SeparatedSection[],
+  segmentSize: ArrangementSegmentSize = "4bars",
+) {
+  const { sampleRate, frames } = grid.audio;
+  if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0 || !Number.isSafeInteger(frames) || frames <= 0) {
+    throw new Error("Backend beat grid has invalid source sample metadata.");
+  }
+  const beatSamples = grid.analysis.beats.map((beat) => beat.samplePosition);
+  const downbeatSamples = grid.analysis.downbeats.map((beat) => beat.samplePosition);
+  const bars = downbeatSamples
+    .filter((sample, index) => Number.isSafeInteger(sample) && sample >= 0 && sample < frames && (index === 0 || sample > downbeatSamples[index - 1]))
+    .map((startSample, index, starts) => ({
+      number: index + 1,
+      startSample,
+      endSample: starts[index + 1] ?? frames,
+    }));
+  const completedById = Object.fromEntries(sections.map((section) => [section.id, section]));
+  updateState({
+    masterTimeline: {
+      originSample: 0,
+      sampleRate,
+      bpm: grid.analysis.bpm,
+      meter: grid.analysis.beatsPerBar,
+      beatSamples,
+      downbeatSamples,
+      bars,
+    },
+    beatMarkerGrid: {
+      sampleRate,
+      bpm: grid.analysis.bpm,
+      beatSamples,
+      downbeatSamples,
+      engine: grid.analysis.engine,
+      engineVersion: grid.analysis.engineVersion ?? "unknown",
+      modelVersion: grid.analysis.modelVersion,
+      inputStem: grid.analysis.inputStem,
+    },
+    sections: sections.map((section) => ({
+      id: section.id,
+      index: section.index,
+      startBar: section.startBar,
+      endBar: section.endBar,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      startSample: section.startSample,
+      endSample: section.endSample,
+      processStartSample: section.startSample,
+      processEndSample: section.endSample,
+      trimStartSample: 0,
+      trimEndSample: section.endSample - section.startSample,
+      duration: section.endTime - section.startTime,
+      chunkIds: [section.id],
+      kind: section.kind ?? (section.startBar === 0 && section.endBar === 0 ? "pickup" : "bars"),
+    })),
+    segmentSize,
+    completedSections: completedById,
+    sectionProgress: Object.fromEntries(sections.map((section) => [section.id, 100])),
+    sectionErrors: {},
+    status: "separating",
+    error: null,
+  });
+}
+
+export function setSegmentSizePreference(segmentSize: ArrangementSegmentSize) {
+  updateState({ segmentSize });
+}
+
+/** Replace only the locally derived segmentation while retaining the shared beat grid. */
+export function setArrangementSections(sections: SeparatedSection[], segmentSize: ArrangementSegmentSize) {
+  const completedSections = Object.fromEntries(sections.map((section) => [section.id, section]));
+  updateState({
+    segmentSize,
+    sections: sections.map((section) => ({
+      id: section.id,
+      index: section.index,
+      startBar: section.startBar,
+      endBar: section.endBar,
+      startTime: section.startTime,
+      endTime: section.endTime,
+      startSample: section.startSample,
+      endSample: section.endSample,
+      processStartSample: section.startSample,
+      processEndSample: section.endSample,
+      trimStartSample: 0,
+      trimEndSample: section.endSample - section.startSample,
+      duration: section.endTime - section.startTime,
+      chunkIds: [section.id],
+      kind: section.kind ?? "bars",
+    })),
+    completedSections,
+    sectionProgress: Object.fromEntries(sections.map((section) => [section.id, 100])),
+    sectionErrors: {},
+    status: "complete",
+    error: null,
+  });
+}
+
+/** Publish segment geometry as soon as the backend marks a segment READY. */
+export function addServerSegment(section: SeparatedSection, segmentSize: ArrangementSegmentSize) {
+  const metadata: SeparationSection = {
+    id: section.id,
+    index: section.index,
+    startBar: section.startBar,
+    endBar: section.endBar,
+    startTime: section.startTime,
+    endTime: section.endTime,
+    startSample: section.startSample,
+    endSample: section.endSample,
+    processStartSample: section.startSample,
+    processEndSample: section.endSample,
+    trimStartSample: 0,
+    trimEndSample: 0,
+    duration: section.endTime - section.startTime,
+    chunkIds: [section.id],
+    kind: section.kind ?? "bars",
+  };
+  const sections = [...state.sections.filter((item) => item.id !== section.id), metadata].sort((a, b) => a.startSample - b.startSample);
+  updateState({
+    sections,
+    completedSections: { ...state.completedSections, [section.id]: section },
+    sectionProgress: { ...state.sectionProgress, [section.id]: 100 },
+    segmentSize,
+    status: "separating",
   });
 }
 
@@ -138,6 +418,35 @@ export function setSeparationPlan(sections: SeparationSection[]) {
     status: "separating",
     error: null,
   });
+}
+
+/** Publish the backend's durable sample schedule before chunks finish, so bars can show pending state. */
+export function setBackendChunkSchedule(
+  jobId: string,
+  boundaries: Array<{ index: number; bar_number: number | null; start_sample: number; end_sample: number; sample_rate: number }>,
+) {
+  const sections: SeparationSection[] = boundaries.map((boundary) => {
+    const id = `${jobId.replaceAll("-", "")}-${String(boundary.index).padStart(6, "0")}`;
+    return {
+      id,
+      index: boundary.index,
+      startBar: boundary.bar_number ?? 0,
+      endBar: boundary.bar_number === null ? 0 : boundary.bar_number + 1,
+      startTime: boundary.start_sample / boundary.sample_rate,
+      endTime: boundary.end_sample / boundary.sample_rate,
+      startSample: boundary.start_sample,
+      endSample: boundary.end_sample,
+      processStartSample: boundary.start_sample,
+      processEndSample: boundary.end_sample,
+      trimStartSample: 0,
+      trimEndSample: 0,
+      duration: (boundary.end_sample - boundary.start_sample) / boundary.sample_rate,
+      chunkIds: [id],
+      kind: boundary.bar_number === null ? "pickup" : "bars",
+    };
+  });
+  const sectionProgress = Object.fromEntries(sections.map((section) => [section.id, state.completedSections[section.id] ? 100 : state.sectionProgress[section.id] ?? 0]));
+  updateState({ sections, sectionProgress, status: "separating", error: null });
 }
 
 // Progress for the currently processing section.
@@ -208,6 +517,16 @@ export function setMasterTimelineSections(
         ...bar,
         endSample: Math.min(durationSample, bar.endSample),
       })),
+    },
+    beatMarkerGrid: {
+      sampleRate,
+      bpm: analysis.bpm,
+      beatSamples: analysis.beats.map((beat) => Math.round(beat * sampleRate)),
+      downbeatSamples: analysis.downbeats.map((beat) => Math.round(beat * sampleRate)),
+      engine: "browser-analysis",
+      engineVersion: "local",
+      modelVersion: null,
+      inputStem: "drums",
     },
     sections,
     completedSections: completedById,

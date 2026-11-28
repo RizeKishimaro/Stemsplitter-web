@@ -1,75 +1,32 @@
-# React + TypeScript + Vite
+# DubPad
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+DubPad is a browser-based stem separation, beat analysis, and music remix workstation. Audio import, analysis, and SCNet stem separation run locally in the browser through Web Workers and ONNX Runtime Web.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Requirements: Node.js and pnpm.
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+pnpm install
+pnpm dev
 ```
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+Run the TypeScript check and production build with:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+pnpm exec tsc --noEmit
+pnpm build
 ```
+
+The Rust API is maintained in the sibling `soniclab-backend` project. Its existing package identifier and API paths remain unchanged while user-facing documentation and API metadata use DubPad branding.
+
+To connect Rust HTDemucs jobs, set `VITE_RUST_API_URL` to the backend origin (for example `http://localhost:8787`). With an audio file loaded, choose Mix first or Drums first and the meter, then select **Separate with HTDemucs**. Completed four-stem bars are fetched over HTTP as WebSocket `chunk.completed` events arrive and added to the arrangement at the exact source sample range. The final beat grid is imported from the persisted Beat This result. The existing browser-local separation workflow remains available separately.
+
+## Browser audio pipeline
+
+- Music analysis and section processing run in workers.
+- Stem separation uses SCNet with ONNX Runtime Web in the browser.
+- The four arrangement tracks are drums, bass, other, and vocals.
+- Original sample positions are retained as the timing authority for arrangement sections.
+
+This repository is a Vite + React + TypeScript application. Its npm package identifier remains `soniclab-web` for compatibility.

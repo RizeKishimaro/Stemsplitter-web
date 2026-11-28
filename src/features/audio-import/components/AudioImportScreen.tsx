@@ -4,7 +4,7 @@ import type { ChangeEvent, DragEvent } from "react";
 import "./AudioImportScreen.css";
 
 type AudioImportScreenProps = {
-  onAudioLoaded: (file: File, audioBuffer: AudioBuffer) => void;
+  onAudioLoaded: (file: File) => void;
 };
 
 const SUPPORTED_EXTENSIONS = [
@@ -54,16 +54,10 @@ export function AudioImportScreen({
 
     setIsLoading(true);
 
-    let context: AudioContext | undefined;
-
     try {
-      const arrayBuffer = await file.arrayBuffer();
-
-      context = new AudioContext();
-
-      const audioBuffer = await context.decodeAudioData(arrayBuffer);
-
-      onAudioLoaded(file, audioBuffer);
+      // Upload the encoded File directly. Source probing and decoding belong to
+      // the backend worker; importing does not allocate a full decoded song.
+      onAudioLoaded(file);
     } catch (err) {
       console.error("[Audio Import]", err);
 
@@ -71,7 +65,6 @@ export function AudioImportScreen({
         "Could not decode this audio file. Try another format or file.",
       );
     } finally {
-      await context?.close();
       setIsLoading(false);
 
       if (inputRef.current) {
@@ -186,4 +179,3 @@ export function AudioImportScreen({
     </section>
   );
 }
-
