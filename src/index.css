@@ -33,3 +33,25 @@ button,
 input {
   font: inherit;
 }
+
+/* UI copy: Figma typeface (JetBrains Mono, SIL Open Font License), served locally. */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-latin-700-normal.woff2") format("woff2");
+}
+
+:root {
+  --ui-font: "JetBrains Mono", ui-monospace, monospace;
+  --ui-ink: #1a1a1a;
+}

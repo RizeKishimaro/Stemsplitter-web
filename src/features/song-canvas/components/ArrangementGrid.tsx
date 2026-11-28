@@ -154,7 +154,7 @@ function ClipControls({
     >
       <button
         type="button"
-        className={`clip-control ${isInPlaybackSession ? "is-active" : ""}`}
+        className={`clip-control clip-control--play ${isInPlaybackSession ? "is-active" : ""}`}
         title={
           isPlaying
             ? "Pause this clip"
@@ -170,37 +170,37 @@ function ClipControls({
         aria-pressed={isInPlaybackSession}
         onClick={handlePlay}
       >
-        {isPlaying ? "Ⅱ" : "▶"}
+        {isPlaying
+          ? <span className="ui-glyph ui-glyph--pause" aria-hidden="true" />
+          : <span className="ui-glyph" style={{ "--icon": "url(/icons/figma/btn-play.svg)" } as CSSProperties} aria-hidden="true" />}
       </button>
 
+      <div className="arrangement-clip__tools">
       <button
         type="button"
-        className="clip-control"
+        className="clip-control clip-control--cut"
         title="Cut clip in half"
         aria-label="Cut clip in half"
         onClick={handleSplit}
       >
-        <span className="clip-icon">✂</span>
+        <span className="ui-glyph" style={{ "--icon": "url(/icons/figma/btn-scissors.svg)" } as CSSProperties} aria-hidden="true" />
       </button>
 
+      {canLink && (
       <button
         type="button"
-        className="clip-control"
-        title={
-          canLink
-            ? "Link clips"
-            : "Select a sibling clip to link"
-        }
+        className="clip-control clip-control--link"
+        title="Link clips"
         aria-label="Link clips"
-        disabled={!canLink}
         onClick={handleLink}
       >
-        <span className="clip-icon">↔</span>
+        <span className="ui-glyph" style={{ "--icon": "url(/icons/figma/btn-link.svg)" } as CSSProperties} aria-hidden="true" />
       </button>
+      )}
 
       <button
         type="button"
-        className={`clip-control ${clip.loopEnabled ? "is-active" : ""}`}
+        className={`clip-control clip-control--loop ${clip.loopEnabled ? "is-active" : ""}`}
         title={
           clip.loopEnabled
             ? "Disable loop"
@@ -214,8 +214,9 @@ function ClipControls({
         aria-pressed={clip.loopEnabled}
         onClick={handleLoop}
       >
-        <span className="clip-icon">↻</span>
+        <span className="ui-glyph" style={{ "--icon": "url(/icons/figma/btn-loop.svg)" } as CSSProperties} aria-hidden="true" />
       </button>
+      </div>
     </div>
   );
 }
@@ -357,10 +358,10 @@ function SectionClip({
       data-clip-id={clip.id}
       onClick={() => selectClip(clip.id)}
       style={{
-        left: `${leftPercent}%`,
-        width: `${widthPercent}%`,
+        // UI copy: 1px in from the grid line on the left, 1px short of the next one.
+        left: `calc(${leftPercent}% + 1px)`,
+        width: `calc(${widthPercent}% - 1px)`,
       }}
-      title={`${clip.stem.toUpperCase()} · ${clip.startTime.toFixed(2)}s–${clip.endTime.toFixed(2)}s`}
     >
       <ClipPlayhead clip={clip} transport={transport} />
 
