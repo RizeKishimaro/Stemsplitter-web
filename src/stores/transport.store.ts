@@ -6,6 +6,7 @@ export type PlaybackMode = "arrangement" | "clip" | null;
 
 export type TransportState = {
   isPlaying: boolean;
+  isBuffering: boolean;
   isPaused: boolean;
   currentTime: number;
   duration: number;
@@ -16,6 +17,7 @@ export type TransportState = {
 
 const initialState: TransportState = {
   isPlaying: false,
+  isBuffering: false,
   isPaused: false,
   currentTime: 0,
   duration: 0,

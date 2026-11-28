@@ -5,6 +5,7 @@ type EngineSnapshot = {
   transport: {
     currentTime: number;
     isPlaying: boolean;
+    isBuffering: boolean;
     isPaused: boolean;
     playingClipIds: string[];
   };
@@ -36,7 +37,9 @@ declare global {
       resume: () => Promise<void>;
       seek: (position: number) => void;
       stop: () => void;
+      clearPreparedBuffers: () => void;
       installSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
+      installRemoteSyntheticProject: (durationSeconds: number) => string[];
       replaceSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
       snapshot: () => EngineSnapshot;
     };
@@ -51,6 +54,19 @@ async function installProject(page: import("@playwright/test").Page, start: numb
 
 async function snapshot(page: import("@playwright/test").Page) {
   return page.evaluate(() => window.__SONICLAB_E2E__!.snapshot());
+}
+
+function makePcmWav(sampleRate: number, frames: number, frequency: number) {
+  const bytes = Buffer.alloc(44 + frames * 2);
+  bytes.write("RIFF", 0); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write("WAVE", 8);
+  bytes.write("fmt ", 12); bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22); bytes.writeUInt32LE(sampleRate, 24);
+  bytes.writeUInt32LE(sampleRate * 2, 28); bytes.writeUInt16LE(2, 32); bytes.writeUInt16LE(16, 34);
+  bytes.write("data", 36); bytes.writeUInt32LE(frames * 2, 40);
+  for (let frame = 0; frame < frames; frame++) {
+    bytes.writeInt16LE(Math.round(Math.sin(2 * Math.PI * frequency * frame / sampleRate) * 8_000), 44 + frame * 2);
+  }
+  return bytes;
 }
 
 async function startClipFromUi(page: import("@playwright/test").Page, clipId: string) {
@@ -174,5 +190,82 @@ test.describe("Firefox Web Audio lifecycle", () => {
     expect(afterSeek.transport.currentTime).toBeGreaterThanOrEqual(1);
     await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
     expect((await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(0);
+  });
+
+  test("slow remote stem waits at the shared section barrier and starts on the same audio clock", async ({ page }) => {
+    await page.goto("/?e2e=1");
+    let bassRequests = 0;
+    await page.route("**/e2e-audio/*.wav", async (route) => {
+      const stem = new URL(route.request().url()).pathname.split("/").at(-1)!.replace(".wav", "");
+      if (stem === "bass") {
+        bassRequests++;
+        await new Promise((resolve) => setTimeout(resolve, 450));
+      }
+      const frequency = ({ drums: 73, bass: 113, other: 211, vocals: 421 } as Record<string, number>)[stem] ?? 100;
+      await route.fulfill({ contentType: "audio/wav", body: makePcmWav(48_000, 48_000, frequency) });
+    });
+    await page.evaluate(() => window.__SONICLAB_E2E__!.installRemoteSyntheticProject(1));
+    await page.evaluate(() => window.__SONICLAB_E2E__!.playArrangement(0));
+    await expect.poll(async () => (await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(4);
+    const diagnostics = (await snapshot(page)).audioDiagnostics!;
+    expect(new Set(diagnostics.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
+    expect(new Set(diagnostics.activeSources.map((source) => source.stem))).toEqual(new Set(["drums", "bass", "other", "vocals"]));
+    expect(bassRequests).toBe(1);
+    await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
+  });
+
+  test("slow remote stems rejoin together after arrangement resume and seek", async ({ page }) => {
+    await page.goto("/?e2e=1");
+    let bassRequests = 0;
+    await page.route("**/e2e-audio/*.wav", async (route) => {
+      const stem = new URL(route.request().url()).pathname.split("/").at(-1)!.replace(".wav", "");
+      if (stem === "bass") {
+        bassRequests++;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+      await route.fulfill({ contentType: "audio/wav", body: makePcmWav(48_000, 48_000, 120) });
+    });
+    await page.evaluate(() => window.__SONICLAB_E2E__!.installRemoteSyntheticProject(2));
+    await page.evaluate(() => window.__SONICLAB_E2E__!.playArrangement(0));
+    await expect.poll(async () => (await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(4);
+
+    await page.evaluate(() => window.__SONICLAB_E2E__!.pause());
+    await page.evaluate(() => window.__SONICLAB_E2E__!.clearPreparedBuffers());
+    const beforeResume = bassRequests;
+    await page.evaluate(() => window.__SONICLAB_E2E__!.resume());
+    expect(bassRequests).toBeGreaterThan(beforeResume);
+    const afterResume = (await snapshot(page)).audioDiagnostics!;
+    expect(afterResume.activeSourceCount).toBe(4);
+    expect(new Set(afterResume.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
+
+    await page.evaluate(() => window.__SONICLAB_E2E__!.clearPreparedBuffers());
+    await page.evaluate(() => window.__SONICLAB_E2E__!.seek(0.25));
+    await expect.poll(async () => (await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(4);
+    const afterSeek = (await snapshot(page)).audioDiagnostics!;
+    expect(new Set(afterSeek.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
+    await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
+  });
+
+  test("failed stem load reports buffering instead of phantom audible playback", async ({ page }) => {
+    await page.goto("/?e2e=1");
+    let bassRequests = 0;
+    await page.route("**/e2e-audio/*.wav", async (route) => {
+      const stem = new URL(route.request().url()).pathname.split("/").at(-1)!.replace(".wav", "");
+      if (stem === "bass") {
+        bassRequests++;
+        await route.fulfill({ status: 503, body: "segment unavailable" });
+        return;
+      }
+      await route.fulfill({ contentType: "audio/wav", body: makePcmWav(48_000, 48_000, 100) });
+    });
+    await page.evaluate(() => window.__SONICLAB_E2E__!.installRemoteSyntheticProject(1));
+    await page.evaluate(() => window.__SONICLAB_E2E__!.playArrangement(0));
+    const state = await snapshot(page);
+    expect(state.audioDiagnostics?.activeSourceCount).toBe(0);
+    expect(state.transport.isPlaying).toBe(false);
+    expect(state.transport.isBuffering).toBe(true);
+    await page.waitForTimeout(150);
+    expect(bassRequests).toBeLessThanOrEqual(2);
+    await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
   });
 });

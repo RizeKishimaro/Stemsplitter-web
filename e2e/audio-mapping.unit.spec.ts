@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import {
+  mapSourceSampleRate,
   mapTimelineToClipSource,
   sourceRangeMatchesTimeline,
 } from "../src/features/audio-engine/sourceMapping";
@@ -54,6 +55,13 @@ test("source range duration must match timeline within one buffer sample", () =>
   expect(sourceRangeMatchesTimeline(0, 48_000, 0, 1, 48_000)).toBe(true);
   expect(sourceRangeMatchesTimeline(0, 47_000, 0, 1, 48_000)).toBe(false);
   expect(sourceRangeMatchesTimeline(100, 50, 0, 1, 48_000)).toBe(false);
+});
+
+test("source frame offsets are converted to the decoded AudioBuffer sample clock", () => {
+  expect(mapSourceSampleRate(44_100, 44_100, 48_000)).toBe(48_000);
+  expect(mapSourceSampleRate(22_050, 44_100, 48_000)).toBe(24_000);
+  expect(mapSourceSampleRate(48_000, 48_000, 44_100)).toBe(44_100);
+  expect(mapSourceSampleRate(-1, 44_100, 48_000)).toBeNull();
 });
 
 test("visual frame ticks do not broadcast full transport state", () => {
