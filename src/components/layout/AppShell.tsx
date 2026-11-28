@@ -43,6 +43,7 @@ declare global {
       seek: (position: number) => void;
       stop: () => void;
       installSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
+      installRemoteSyntheticProject: (durationSeconds: number) => string[];
       replaceSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
       snapshot: () => {
         audioContextCurrentTime: number;
@@ -246,6 +247,30 @@ export function AppShell() {
       return Object.keys(getClipState().clips);
     };
 
+    const installRemoteSyntheticProject = (durationSeconds: number) => {
+      audioEngine.stop();
+      audioEngine.clearPreparedBuffers();
+      resetClips();
+      const sampleRate = getAudioContext().sampleRate;
+      const frameCount = Math.max(2, Math.round(durationSeconds * sampleRate));
+      const id = `e2e-remote-${Math.random().toString(36).slice(2)}`;
+      const stemNames = ["drums", "bass", "other", "vocals"] as const;
+      const section: SeparatedSection = {
+        id, index: 0, startBar: 1, endBar: 2,
+        startSample: 0, endSample: frameCount, startTime: 0, endTime: frameCount / sampleRate,
+        sampleRate,
+        serverStems: Object.fromEntries(stemNames.map((stem) => [stem, {
+          parts: [{ url: `/e2e-audio/${stem}.wav`, sampleRate, channels: 1, frames: frameCount,
+            startSample: 0, endSample: frameCount, audioFormat: "wav" as const }],
+          sampleRate, channels: 1, frames: frameCount, audioFormat: "wav" as const,
+        }])) as NonNullable<SeparatedSection["serverStems"]>,
+        stems: { drums: [], bass: [], other: [], vocals: [] },
+      };
+      setArrangementSections([section], "4bars");
+      registerSectionClips(section);
+      return Object.keys(getClipState().clips);
+    };
+
     window.__SONICLAB_E2E__ = {
       playArrangement: (position) => audioEngine.playArrangement(position),
       playClip: (clipId) => audioEngine.playClip(clipId),
@@ -255,6 +280,7 @@ export function AppShell() {
       seek: (position) => audioEngine.seek(position),
       stop: () => audioEngine.stop(),
       installSyntheticProject,
+      installRemoteSyntheticProject,
       replaceSyntheticProject: installSyntheticProject,
       snapshot: () => ({
         audioContextCurrentTime: getAudioContext().currentTime,
