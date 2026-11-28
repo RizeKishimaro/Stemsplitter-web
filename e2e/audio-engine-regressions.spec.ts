@@ -37,6 +37,7 @@ declare global {
       resume: () => Promise<void>;
       seek: (position: number) => void;
       stop: () => void;
+      clearPreparedBuffers: () => void;
       installSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
       installRemoteSyntheticProject: (durationSeconds: number) => string[];
       replaceSyntheticProject: (timelineStart: number, durationSeconds: number) => string[];
@@ -210,6 +211,38 @@ test.describe("Firefox Web Audio lifecycle", () => {
     expect(new Set(diagnostics.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
     expect(new Set(diagnostics.activeSources.map((source) => source.stem))).toEqual(new Set(["drums", "bass", "other", "vocals"]));
     expect(bassRequests).toBe(1);
+    await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
+  });
+
+  test("slow remote stems rejoin together after arrangement resume and seek", async ({ page }) => {
+    await page.goto("/?e2e=1");
+    let bassRequests = 0;
+    await page.route("**/e2e-audio/*.wav", async (route) => {
+      const stem = new URL(route.request().url()).pathname.split("/").at(-1)!.replace(".wav", "");
+      if (stem === "bass") {
+        bassRequests++;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+      await route.fulfill({ contentType: "audio/wav", body: makePcmWav(48_000, 48_000, 120) });
+    });
+    await page.evaluate(() => window.__SONICLAB_E2E__!.installRemoteSyntheticProject(2));
+    await page.evaluate(() => window.__SONICLAB_E2E__!.playArrangement(0));
+    await expect.poll(async () => (await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(4);
+
+    await page.evaluate(() => window.__SONICLAB_E2E__!.pause());
+    await page.evaluate(() => window.__SONICLAB_E2E__!.clearPreparedBuffers());
+    const beforeResume = bassRequests;
+    await page.evaluate(() => window.__SONICLAB_E2E__!.resume());
+    expect(bassRequests).toBeGreaterThan(beforeResume);
+    const afterResume = (await snapshot(page)).audioDiagnostics!;
+    expect(afterResume.activeSourceCount).toBe(4);
+    expect(new Set(afterResume.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
+
+    await page.evaluate(() => window.__SONICLAB_E2E__!.clearPreparedBuffers());
+    await page.evaluate(() => window.__SONICLAB_E2E__!.seek(0.25));
+    await expect.poll(async () => (await snapshot(page)).audioDiagnostics?.activeSourceCount).toBe(4);
+    const afterSeek = (await snapshot(page)).audioDiagnostics!;
+    expect(new Set(afterSeek.activeSchedules.map((schedule) => schedule.scheduledContextTime)).size).toBe(1);
     await page.evaluate(() => window.__SONICLAB_E2E__!.stop());
   });
 
