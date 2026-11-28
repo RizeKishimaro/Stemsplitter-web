@@ -11,6 +11,14 @@ export type ClipSourceMapping = {
   sourceOffsetSeconds: number;
 };
 
+/** Convert an integer frame position between sample clocks without changing time. */
+export function mapSourceSampleRate(sample: number, sourceRate: number, bufferRate: number): number | null {
+  if (!Number.isSafeInteger(sample) || sample < 0 || !Number.isSafeInteger(sourceRate) || sourceRate <= 0 ||
+    !Number.isSafeInteger(bufferRate) || bufferRate <= 0) return null;
+  const mapped = Math.round(sample * bufferRate / sourceRate);
+  return Number.isSafeInteger(mapped) ? mapped : null;
+}
+
 /**
  * Map a global timeline position into a section-local AudioBuffer coordinate.
  * `sourceStartSample` is the buffer frame corresponding to `clipStartTime`;

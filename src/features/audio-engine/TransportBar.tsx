@@ -57,7 +57,9 @@ export function TransportBar() {
           ? "PLAYING"
           : transport.isPaused
             ? "PAUSED"
-            : "STOPPED"}
+            : transport.isBuffering
+              ? "BUFFERING"
+              : "STOPPED"}
       </span>
     </div>
   );
